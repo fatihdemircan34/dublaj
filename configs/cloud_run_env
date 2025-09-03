@@ -1,0 +1,4 @@
+# Example runtime env
+HF_TOKEN=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
+GOOGLE_CLOUD_PROJECT=voiceprocess-58fbc
+BUCKET=gs://my-bucket

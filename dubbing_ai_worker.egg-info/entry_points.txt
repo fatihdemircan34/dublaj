@@ -1,0 +1,2 @@
+[console_scripts]
+asr-diarize = dubbing_ai.runner:main

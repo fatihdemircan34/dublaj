@@ -1,0 +1,26 @@
+Metadata-Version: 2.4
+Name: dubbing-ai-worker
+Version: 0.1.0
+Summary: ASR + Diarization worker with plugin architecture (WhisperX + pyannote / NeMo MSDD / GCP STT)
+Author-email: Your Org <dev@example.com>
+Requires-Python: >=3.10
+Requires-Dist: click>=8.1.7
+Requires-Dist: pydantic>=2.7.3
+Requires-Dist: tqdm>=4.66.4
+Requires-Dist: numpy>=1.26.4
+Requires-Dist: pandas>=2.2.2
+Requires-Dist: librosa>=0.10.1
+Requires-Dist: soundfile>=0.12.1
+Requires-Dist: ffmpeg-python>=0.2.0
+Requires-Dist: google-cloud-storage>=2.16.0
+Requires-Dist: google-cloud-speech>=2.27.0
+Requires-Dist: webrtcvad>=2.0.10
+Requires-Dist: faster-whisper>=1.0.3
+Requires-Dist: whisperx>=3.1.1
+Requires-Dist: torch>=2.1
+Requires-Dist: torchaudio>=2.1
+Requires-Dist: scikit-learn>=1.4.2
+Requires-Dist: pyannote.audio>=3.1.0
+Provides-Extra: nemo
+Requires-Dist: nemo-toolkit[asr]>=1.25.0; extra == "nemo"
+Requires-Dist: onnxruntime-gpu>=1.17.0; extra == "nemo"
