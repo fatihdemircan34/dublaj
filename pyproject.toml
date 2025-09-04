@@ -1,42 +1,20 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "dubbing-ai-worker"
+name = "dubbing_ai"
 version = "0.1.0"
-description = "ASR + Diarization worker with plugin architecture (WhisperX + pyannote / NeMo MSDD / GCP STT)"
-authors = [{name="Your Org", email="dev@example.com"}]
+description = "Dubbing / ASR + diarization utilities"
 requires-python = ">=3.10"
-dependencies = [
-    "click>=8.1.7",
-    "pydantic>=2.7.3",
-    "tqdm>=4.66.4",
-    "numpy>=1.26.4",
-    "pandas>=2.2.2",
-    "librosa>=0.10.1",
-    "soundfile>=0.12.1",
-    "ffmpeg-python>=0.2.0",
-    "google-cloud-storage>=2.16.0",
-    "google-cloud-speech>=2.27.0",
-    "webrtcvad>=2.0.10",
-    "faster-whisper>=1.0.3",
-    "whisperx>=3.1.1",
-    "torch>=2.1",
-    "torchaudio>=2.1",
-    "scikit-learn>=1.4.2",
-    "pyannote.audio>=3.1.0"
-]
+readme = "README.md"
+authors = [{ name = "VoiceProcess", email = "dev@voiceprocess.io" }]
+license = { text = "Proprietary" }
+dependencies = []
 
-[project.optional-dependencies]
-nemo = [
-    "nemo-toolkit[asr]>=1.25.0",
-    "onnxruntime-gpu>=1.17.0"
-]
-
-[project.scripts]
-asr-diarize = "dubbing_ai.runner:main"
+[tool.setuptools]
+include-package-data = true
 
 [tool.setuptools.packages.find]
-where = [""]
 include = ["dubbing_ai*"]
+

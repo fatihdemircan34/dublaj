@@ -2,12 +2,23 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 from typing import List, Optional, Iterable, Dict, Any
 import json
+from pydantic import BaseModel, ConfigDict
+
+# dubbing_ai/artifact_types.py
+from typing import Optional, Union
+from pydantic import BaseModel, ConfigDict  # v2
 
 class Word(BaseModel):
-    w: str = Field(..., description="Word text")
-    s: float = Field(..., description="Word start time (sec)")
-    e: float = Field(..., description="Word end time (sec)")
-    p: Optional[float] = Field(default=None, description="Word confidence")
+    # allow either string labels (“SPEAKER_00”) or ints (0,1,…)
+    w: str
+    s: float
+    e: float
+    p: Optional[float] = None
+    spk: Optional[Union[str, int]] = None
+
+    # optional, but makes future extra keys harmless
+    model_config = ConfigDict(extra="allow")
+
 
 class ASRSegment(BaseModel):
     id: str

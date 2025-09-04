@@ -8,6 +8,10 @@ class Word(BaseModel):
     s: float = Field(..., description="Word start time (sec)")
     e: float = Field(..., description="Word end time (sec)")
     p: Optional[float] = Field(default=None, description="Word confidence")
+    # Assigned speaker labels (populated by align/assign_words.py)
+    spk: Optional[str] = Field(default=None, description="Assigned speaker label")
+    # Optional second-best speaker (if overlap passes threshold)
+    spk2: Optional[str] = Field(default=None, description="Second-best speaker label (optional)")
 
 class ASRSegment(BaseModel):
     id: str
