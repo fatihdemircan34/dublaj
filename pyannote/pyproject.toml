@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "bana-audio-flow"
+version = "0.1.0"
+description = "brouhaha VAD + OSD + diarization + word-level JSONL"
+authors = ["Fatih"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.12"
+pyannote.audio = ">=3.1,<3.2"
+# torch/torchaudio sürümünü ortamına göre belirle:
+torch = ">=2.2,<2.5"
+torchaudio = ">=2.2,<2.5"
+# ASR (kelime zaman damgaları)
+faster-whisper = "^1.0.3"
+# ses dosyası IO
+soundfile = "^0.12.1"
+numpy = "^1.26"
+brouhaha-vad = { git = "https://github.com/marianne-m/brouhaha-vad", branch = "main" }
+
+[tool.poetry.scripts]
+bana-audio = "app:main"

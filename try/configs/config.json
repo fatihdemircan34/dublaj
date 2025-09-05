@@ -1,0 +1,22 @@
+{
+    "default_settings": {
+        "model_size": "large-v3\"",
+        "device": "auto",
+        "language": null,
+        "min_speakers": null,
+        "max_speakers": null,
+        "overlap_threshold": 0.25,
+        "smoothing_window": 3
+    },
+    "model_sizes": {
+        "tiny": {"memory_usage": "low", "speed": "fastest", "accuracy": "low"},
+        "base": {"memory_usage": "low", "speed": "fast", "accuracy": "medium"},
+        "small": {"memory_usage": "medium", "speed": "medium", "accuracy": "good"},
+        "medium": {"memory_usage": "medium", "speed": "medium", "accuracy": "good"},
+        "large-v2": {"memory_usage": "high", "speed": "slow", "accuracy": "excellent"},
+        "large-v3": {"memory_usage": "high", "speed": "slow", "accuracy": "excellent"}
+    },
+    "supported_languages": [
+        "tr", "en", "de", "fr", "es", "it", "pt", "ru", "ja", "ko", "zh"
+    ]
+}

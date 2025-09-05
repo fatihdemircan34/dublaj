@@ -1,0 +1,25 @@
+{
+  "pipeline_summary": {
+    "audio_file": "input_6.wav",
+    "output_file": "wordsw.jsonl",
+    "output_directory": ".",
+    "models_used": {
+      "vad": "pyannote/brouhaha",
+      "osd": "pyannote/segmentation-3.0",
+      "diarization": "pyannote/speaker-diarization-3.1",
+      "asr": "large-v3"
+    },
+    "final_statistics": {
+      "total_words_from_asr": 499,
+      "written_words": 499,
+      "filtered_words": 0,
+      "overlap_words": 499,
+      "detected_speakers": 3,
+      "vad_segments": 1,
+      "vad_total_duration": 137.649,
+      "osd_segments": 23,
+      "osd_total_duration": 44.584,
+      "diarization_segments": 27
+    }
+  }
+}
