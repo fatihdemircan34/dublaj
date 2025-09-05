@@ -1,2 +1,5 @@
 try/venv/*
 /.venv/
+/try/.test/*
+
+/try/.nemo/*
