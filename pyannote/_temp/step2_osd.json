@@ -1,0 +1,131 @@
+{
+  "step": "overlapped_speech_detection",
+  "model": "pyannote/segmentation-3.0",
+  "parameters": {
+    "onset": 0.0,
+    "offset": 0.0,
+    "min_duration_on": 0.1,
+    "min_duration_off": 0.1
+  },
+  "results": {
+    "segments": [
+      {
+        "start": 3.625,
+        "end": 5.6,
+        "duration": 1.974
+      },
+      {
+        "start": 19.015,
+        "end": 21.057,
+        "duration": 2.042
+      },
+      {
+        "start": 25.057,
+        "end": 25.478,
+        "duration": 0.422
+      },
+      {
+        "start": 25.732,
+        "end": 25.934,
+        "duration": 0.203
+      },
+      {
+        "start": 38.692,
+        "end": 41.003,
+        "duration": 2.312
+      },
+      {
+        "start": 42.32,
+        "end": 43.197,
+        "duration": 0.878
+      },
+      {
+        "start": 48.108,
+        "end": 48.58,
+        "duration": 0.473
+      },
+      {
+        "start": 61.388,
+        "end": 65.168,
+        "duration": 3.78
+      },
+      {
+        "start": 71.125,
+        "end": 74.804,
+        "duration": 3.679
+      },
+      {
+        "start": 79.141,
+        "end": 79.428,
+        "duration": 0.287
+      },
+      {
+        "start": 79.698,
+        "end": 83.9,
+        "duration": 4.202
+      },
+      {
+        "start": 84.693,
+        "end": 85.064,
+        "duration": 0.371
+      },
+      {
+        "start": 87.815,
+        "end": 91.443,
+        "duration": 3.628
+      },
+      {
+        "start": 92.843,
+        "end": 95.375,
+        "duration": 2.531
+      },
+      {
+        "start": 97.67,
+        "end": 104.234,
+        "duration": 6.564
+      },
+      {
+        "start": 105.5,
+        "end": 105.787,
+        "duration": 0.287
+      },
+      {
+        "start": 107.305,
+        "end": 109.651,
+        "duration": 2.346
+      },
+      {
+        "start": 111.001,
+        "end": 111.136,
+        "duration": 0.135
+      },
+      {
+        "start": 115.945,
+        "end": 117.734,
+        "duration": 1.789
+      },
+      {
+        "start": 119.067,
+        "end": 120.181,
+        "duration": 1.114
+      },
+      {
+        "start": 121.835,
+        "end": 125.767,
+        "duration": 3.932
+      },
+      {
+        "start": 129.108,
+        "end": 129.445,
+        "duration": 0.338
+      },
+      {
+        "start": 132.145,
+        "end": 133.445,
+        "duration": 1.299
+      }
+    ],
+    "total_segments": 23,
+    "total_duration": 44.584
+  }
+}

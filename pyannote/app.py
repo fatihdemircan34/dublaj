@@ -265,7 +265,7 @@ def main():
 
     audio_path = args.audio
 
-    # Çıktı dizini ayarla
+
     if args.output_dir:
         output_dir = args.output_dir
         os.makedirs(output_dir, exist_ok=True)

@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "dublaj-pipeline"
+version = "0.1.0"
+description = "Dubbing pipeline"
+authors = ["Your Name"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.9,<3.12"
+pyannote.audio = "^3.1.1"
+faster-whisper = "^1.0.3"
+soundfile = "^0.12.1"
+ffmpeg-python = "^0.2.0"
+yt-dlp = "^2024.1.0"
+tqdm = "^4.66.0"
+pydub = "^0.25.1"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

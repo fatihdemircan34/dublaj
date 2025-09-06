@@ -1,20 +1,46 @@
-[build-system]
-requires = ["setuptools>=61", "wheel"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "dubbing_ai"
+[tool.poetry]
+name = "dublaj-pipeline"
 version = "0.1.0"
-description = "Dubbing / ASR + diarization utilities"
-requires-python = ">=3.10"
+description = "Complete dubbing pipeline with VAD, OSD, diarization, ASR, and TTS"
+authors = ["Your Name"]
 readme = "README.md"
-authors = [{ name = "VoiceProcess", email = "dev@voiceprocess.io" }]
-license = { text = "Proprietary" }
-dependencies = []
+package-mode = false
 
-[tool.setuptools]
-include-package-data = true
+[tool.poetry.dependencies]
+python = ">=3.9,<3.12"
 
-[tool.setuptools.packages.find]
-include = ["dubbing_ai*"]
+# Pyannote audio for diarization - CORRECT PACKAGE NAME WITH QUOTES
+"pyannote.audio" = "^3.1.1"
+"pyannote.core" = "^5.0.0"
+"pyannote.database" = "^5.0.1"
+"pyannote.pipeline" = "^3.0.1"
+"pyannote.metrics" = "^3.2.1"
 
+# ASR
+faster-whisper = "^1.0.3"
+
+# Audio processing
+soundfile = "^0.12.1"
+librosa = "^0.10.1"
+pydub = "^0.25.1"
+pyloudnorm = "^0.1.1"
+
+# Basic dependencies
+numpy = ">=1.22.0,<1.27.0"
+scipy = "^1.11.0"
+pandas = "^2.1.0"
+
+# Video processing
+ffmpeg-python = "^0.2.0"
+
+# Download tools
+yt-dlp = "^2024.1.0"
+
+# Utils
+tqdm = "^4.66.0"
+requests = "^2.31.0"
+typing-extensions = "^4.9.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

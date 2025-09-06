@@ -9,35 +9,61 @@ aşamalarını çalıştıran **plugin mimarili** bir AI "worker" servisidir.
 
 > Not: Bu repo **AI worker** katmanıdır. API ve Web UI ayrı projelerdir.
 
+
+
 ## Hızlı Başlangıç (Yerel / GPU)
 
 ```bash
-# Python 3.10+ önerilir, CUDA yüklü GPU ile
-pip install -e .[nemo]
+source $(poetry env info --path)/bin/activate
+# Shell plugin'ini yükle
+poetry self add poetry-plugin-shell
 
-# Veya NeMo olmadan
-# pip install -e .
-
-# HuggingFace token (pyannote için gerekli)
-export HF_TOKEN=hf_xxx
-
-# Basit örnek (pyannote diarization)
-python -m dubbing_ai.runner \
-  --audio gs://my-bucket/input/audio.wav \
-  --out gs://my-bucket/outputs/job-123 \
-  --diarizer pyannote \
-  --domain podcast \
-  --model-size medium
-
-# GCP STT (managed) örnek
-export GOOGLE_CLOUD_PROJECT=my-project
-python -m dubbing_ai.runner --audio ./sample.wav --out ./out --diarizer gcp-stt --min-speakers 1 --max-speakers 4
-
-# NeMo MSDD (telephony/overlap)
-python -m dubbing_ai.runner --audio ./call.wav --out ./out --diarizer nemo-msdd --domain telephony
-```
+# Artık shell komutunu kullanabilirsiniz
+poetry shell
+export HF_TOKEN="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"
+export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/voiceprocess-58fbc-8e5f0264cdc0.json"
 
 ## Çıktılar
+(dublaj-pipeline-py3.10) videodubb_voiceprocess_io@instance-20250904-153243:~/PycharmProjects/dublaj/pyannote$ poetry run python app-full.py --audio ../input_6.wav   --out out.jsonl   --hf-token "$HF_TOKEN"  --do-mix 
+usage: app-full.py [-h] --audio AUDIO --out OUT [--hf-token HF_TOKEN] [--asr-model ASR_MODEL] [--asr-device ASR_DEVICE] [--asr-compute-type ASR_COMPUTE_TYPE] [--vad-onset VAD_ONSET]
+                   [--vad-offset VAD_OFFSET] [--vad-min-on VAD_MIN_ON] [--vad-min-off VAD_MIN_OFF] [--osd-onset OSD_ONSET] [--osd-offset OSD_OFFSET] [--osd-min-on OSD_MIN_ON]
+                   [--osd-min-off OSD_MIN_OFF] [--require-vad] [--vad-coverage VAD_COVERAGE] [--min-speakers MIN_SPEAKERS] [--max-speakers MAX_SPEAKERS] [--output-dir OUTPUT_DIR]
+app-full.py: error: unrecognized arguments: --do-mix
+(dublaj-pipeline-py3.10) videodubb_voiceprocess_io@instance-20250904-153243:~/PycharmProjects/dublaj/pyannote$ poetry run python app-full.py --audio ../input_6.wav   --out out.jsonl   --hf-token "$HF_TOKEN"  
+🎵 Audio: ../input_6.wav
+📝 Çıkış: out.jsonl
+📁 Adım çıktı dizini: .
+🤖 ASR: large-v3 (device=auto, compute=auto)
+============================================================
+📍 ADIM 1: Voice Activity Detection (VAD)
+🔧 VAD modeli yükleniyor (pyannote/brouhaha)...
+Lightning automatically upgraded your loaded checkpoint from v1.6.5 to v2.5.5. To apply the upgrade to your files permanently, run `python -m pytorch_lightning.utilities.upgrade_checkpoint ../../../.cache/torch/pyannote/models--pyannote--brouhaha/snapshots/c93c9b537732dd50c28c0366c73f560c3a7aeb02/pytorch_model.bin`
+Model was trained with pyannote.audio 0.0.1, yours is 3.3.2. Bad things might happen unless you revert pyannote.audio to 0.x.
+Model was trained with torch 1.12.1+cu102, yours is 2.3.1+cu121. Bad things might happen unless you revert torch to 1.x.
+⚙️  VAD parametreleri: onset=0.0, offset=0.0, min_on=0.0, min_off=0.0
+✅ VAD modeli hazır
+🔍 VAD analizi yapılıyor...
+✅ VAD tamam: 1 segment, toplam 137.65s
+💾 step1_vad çıktısı kaydedildi: ./step1_vad.json
+
+📍 ADIM 2: Overlapped Speech Detection (OSD)
+🔧 OSD modeli yükleniyor (pyannote/segmentation-3.1)...
+⚙️  OSD parametreleri: onset=0.0, offset=0.0, min_on=0.1, min_off=0.1
+✅ OSD modeli hazır
+🔍 OSD analizi yapılıyor...
+✅ OSD tamam: 23 segment, toplam 44.58s
+💾 step2_osd çıktısı kaydedildi: ./step2_osd.json
+
+📍 ADIM 3: Speaker Diarization
+🔧 Diarization modeli yükleniyor (pyannote/speaker-diarization-3.1)...
+✅ Diarization modeli hazır
+🔍 Diarization analizi yapılıyor...
+/home/videodubb_voiceprocess_io/.cache/pypoetry/virtualenvs/dublaj-pipeline-KrFI56mV-py3.10/lib/python3.10/site-packages/pyannote/audio/models/blocks/pooling.py:104: UserWarning: std(): degrees of freedom is <= 0. Correction should be strictly less than the reduction factor (input numel divided by output numel). (Triggered internally at ../aten/src/ATen/native/ReduceOps.cpp:1807.)
+  std = sequences.std(dim=-1, correction=1)
+
+
+
+
 ```
 out/
   asr_segments.jsonl
