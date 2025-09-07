@@ -8,3 +8,6 @@ try/venv/*
 /pyannote/step*
 
 /pyannote/_temp/
+pipeline/.venv/
+whisperx_env/
+pyannote/whisperx_env/

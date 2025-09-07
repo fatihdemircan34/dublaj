@@ -9,16 +9,22 @@ package-mode = false
 [tool.poetry.dependencies]
 python = ">=3.9,<3.12"
 
-# PyTorch and torchaudio - REQUIRED for pyannote
-torch = ">=2.0.0"
-torchaudio = ">=2.0.0"
+# PyTorch and torchaudio - REQUIRED for pyannote - Compatible with WhisperX
+torch = ">=2.0.0,<2.5.0"  # WhisperX ile uyumlu versiyon aralığı
+torchaudio = ">=2.0.0,<2.5.0"
 
-# Pyannote audio for diarization
-"pyannote.audio" = "^3.1.1"
+# Updated numpy for compatibility with WhisperX 3.4+
+numpy = ">=2.0.0,<3.0.0"
+
+# Pyannote audio for diarization - Updated for WhisperX compatibility
+"pyannote.audio" = "^3.3.2"
 "pyannote.core" = "^5.0.0"
 "pyannote.database" = "^5.0.1"
 "pyannote.pipeline" = "^3.0.1"
 "pyannote.metrics" = "^3.2.1"
+
+# WhisperX - Enhanced ASR with speaker diarization
+whisperx = "^3.1.1"
 
 # Additional pyannote dependencies
 speechbrain = ">=0.5.16"
@@ -26,7 +32,7 @@ asteroid-filterbanks = "^0.4.0"
 torch-audiomentations = "^0.11.0"
 torch-pitch-shift = "^1.2.4"
 
-# ASR
+# ASR - Keep faster-whisper as fallback
 faster-whisper = "^1.0.3"
 openai-whisper = "^20231117"  # Opsiyonel, faster-whisper'a alternatif
 ctranslate2 = ">=3.20.0"  # faster-whisper için gerekli
@@ -47,9 +53,8 @@ audioread = "^3.0.0"
 resampy = "^0.4.2"
 webrtcvad = "^2.0.10"  # Ek VAD desteği için
 
-# Basic dependencies
-numpy = ">=1.22.0,<1.27.0"
-scipy = "^1.11.0"
+# Basic dependencies - Updated scipy for numpy 2.x compatibility
+scipy = "^1.13.0"
 pandas = "^2.1.0"
 scikit-learn = "^1.3.0"
 matplotlib = "^3.7.0"
@@ -58,7 +63,6 @@ matplotlib = "^3.7.0"
 ffmpeg-python = "^0.2.0"
 opencv-python = "^4.8.0"
 moviepy = "^1.0.3"
-brouhaha = {git = "https://github.com/marianne-m/brouhaha-vad", branch = "main"}
 
 # Download tools
 yt-dlp = "^2024.1.0"
