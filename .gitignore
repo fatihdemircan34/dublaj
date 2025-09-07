@@ -3,3 +3,8 @@ try/venv/*
 /try/.test/*
 
 /try/.nemo/*
+*/__pycache__/*
+/_temp_app/
+/pyannote/step*
+
+/pyannote/_temp/
