@@ -9,7 +9,7 @@ class BuildRefVoicesFromJSONLStep:
     """out.jsonl'den her konuşmacı için ~9 sn referans WAV çıkarır."""
     name = "BuildRefVoices"
 
-    def __init__(self, seconds: float = 9.0, sample_rate: int = 16000) -> None:
+    def __init__(self, seconds: float = 5.0, sample_rate: int = 16000) -> None:
         self.seconds = float(seconds)
         self.sample_rate = int(sample_rate)
 

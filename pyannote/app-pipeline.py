@@ -70,13 +70,23 @@ def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
 
 
 # --- Step classes moved to pipeline_steps package ---
-from pipeline_steps import (
+from step.app_full_core_step import (
     AppFullCoreStep,
-    MergeSentencesStep,
-    BuildRefVoicesFromJSONLStep,
-    SentenceTranslationStep,
-    XTTSPerSegmentStep,
 )
+
+from step.merge_sentences_step import (
+    MergeSentencesStep,
+)
+from step.build_ref_voices_step import (
+    BuildRefVoicesFromJSONLStep,
+)
+from step.sentence_translation_step import (
+    SentenceTranslationStep,
+)
+from step.xtts_per_segment_step import (
+    XTTSPerSegmentStep
+)
+
 
 # ----------------------------- CLI & Runner ----------------------------- #
 
