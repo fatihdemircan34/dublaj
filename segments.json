@@ -1,0 +1,444 @@
+{
+  "segments": [
+    {
+      "id": 0,
+      "seek": 0,
+      "start": 0.211,
+      "end": 3.732,
+      "text": "I'm talking about the kind of diplomacy that's going to end the destruction of yourcountry.",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 1,
+      "seek": 0,
+      "start": 3.752,
+      "end": 5.132,
+      "text": "Yes, but if you are notstrong...",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 2,
+      "seek": 0,
+      "start": 5.193,
+      "end": 10.874,
+      "text": "Mr.President, withrespect, I think it's disrespectful for you to come into the Oval Office and try to litigate this in front of the Americanmedia.",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 3,
+      "seek": 0,
+      "start": 11.234,
+      "end": 17.236,
+      "text": "Rightnow, you guys are going around and forcing conscripts to the front lines because you have manpowerproblems.",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 4,
+      "seek": 0,
+      "start": 17.536,
+      "end": 20.837,
+      "text": "You should be thanking the President to bring an end to thisconflict.",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 5,
+      "seek": 0,
+      "start": 20.877,
+      "end": 23.578,
+      "text": "Have you ever been to Ukraine that you say what problems wehave?",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 6,
+      "seek": 0,
+      "start": 24.038,
+      "end": 25.099,
+      "text": "I have beento...",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 7,
+      "seek": 0,
+      "start": 25.339,
+      "end": 26.6,
+      "text": "Comeonce.",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 8,
+      "seek": 0,
+      "start": 26.78,
+      "end": 33.765,
+      "text": "I've actually watched and seen thestories, and I know what happens is you bringpeople, you bring them on a propagandatour,",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 9,
+      "seek": 0,
+      "start": 33.805,
+      "end": 35.046,
+      "text": "Mr.President.",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 10,
+      "seek": 0,
+      "start": 35.146,
+      "end": 36.968,
+      "text": "Do you disagree that you've had problems",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 11,
+      "seek": 0,
+      "start": 37.728,
+      "end": 39.049,
+      "text": "bringing people into yourmilitary?",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 12,
+      "seek": 0,
+      "start": 39.069,
+      "end": 45.694,
+      "text": "We haveproblems. And do you think that it's respectful to come to the Oval Office of the United States of America and attack the administration that is",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 13,
+      "seek": 0,
+      "start": 45.754,
+      "end": 48.656,
+      "text": "trying to prevent the destruction of yourcountry?",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 14,
+      "seek": 0,
+      "start": 48.877,
+      "end": 49.697,
+      "text": "A lot ofquestions.",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 15,
+      "seek": 0,
+      "start": 49.837,
+      "end": 51.218,
+      "text": "Let's start from thebeginning.",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 16,
+      "seek": 0,
+      "start": 51.258,
+      "end": 52.84,
+      "text": "First ofall, during thewar,",
+      "speaker": "SPEAKER_02"
+    },
+    {
+      "id": 17,
+      "seek": 0,
+      "start": 53.58,
+      "end": 54.68,
+      "text": "Everybody hasproblems,",
+      "speaker": "SPEAKER_02"
+    },
+    {
+      "id": 18,
+      "seek": 0,
+      "start": 55.14,
+      "end": 55.781,
+      "text": "evenyou.",
+      "speaker": "SPEAKER_02"
+    },
+    {
+      "id": 19,
+      "seek": 0,
+      "start": 55.881,
+      "end": 58.601,
+      "text": "But you have nice ocean and don't feelnow.",
+      "speaker": "SPEAKER_02"
+    },
+    {
+      "id": 20,
+      "seek": 0,
+      "start": 58.841,
+      "end": 60.002,
+      "text": "But you will feel it",
+      "speaker": "SPEAKER_02"
+    },
+    {
+      "id": 21,
+      "seek": 0,
+      "start": 60.542,
+      "end": 61.182,
+      "text": "in thefuture.",
+      "speaker": "SPEAKER_02"
+    },
+    {
+      "id": 22,
+      "seek": 0,
+      "start": 61.502,
+      "end": 62.622,
+      "text": "Godbless. You don't knowthat.",
+      "speaker": "SPEAKER_02"
+    },
+    {
+      "id": 23,
+      "seek": 0,
+      "start": 62.662,
+      "end": 64.062,
+      "text": "Godbless. Godbless.",
+      "speaker": "SPEAKER_02"
+    },
+    {
+      "id": 24,
+      "seek": 0,
+      "start": 64.163,
+      "end": 65.263,
+      "text": "You will not have awar.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 25,
+      "seek": 0,
+      "start": 65.523,
+      "end": 66.823,
+      "text": "Don't tell us what we're going tofeel.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 26,
+      "seek": 0,
+      "start": 67.243,
+      "end": 68.704,
+      "text": "We're trying to solve aproblem.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 27,
+      "seek": 0,
+      "start": 68.784,
+      "end": 70.344,
+      "text": "Don't tell us what we're going tofeel.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 28,
+      "seek": 0,
+      "start": 70.404,
+      "end": 71.284,
+      "text": "I'm not tellingyou.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 29,
+      "seek": 0,
+      "start": 71.304,
+      "end": 73.365,
+      "text": "Because you're in no position to dictatethat.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 30,
+      "seek": 0,
+      "start": 73.425,
+      "end": 74.385,
+      "text": "Rememberthis.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 31,
+      "seek": 0,
+      "start": 74.525,
+      "end": 77.106,
+      "text": "You're in no position to dictate",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 32,
+      "seek": 0,
+      "start": 77.506,
+      "end": 78.406,
+      "text": "what we're going tofeel.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 33,
+      "seek": 0,
+      "start": 79.126,
+      "end": 80.708,
+      "text": "We're going to feel verygood.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 34,
+      "seek": 0,
+      "start": 81.328,
+      "end": 84.231,
+      "text": "We're going to feel very good and verystrong.",
+      "speaker": "SPEAKER_02"
+    },
+    {
+      "id": 35,
+      "seek": 0,
+      "start": 84.832,
+      "end": 86.813,
+      "text": "You're right now not in a very goodposition.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 36,
+      "seek": 0,
+      "start": 87.354,
+      "end": 92.379,
+      "text": "You've allowed yourself to be in a very badposition, and he happens to be right aboutit.",
+      "speaker": "SPEAKER_02"
+    },
+    {
+      "id": 37,
+      "seek": 0,
+      "start": 92.399,
+      "end": 94.321,
+      "text": "You're not in a goodposition.",
+      "speaker": "SPEAKER_02"
+    },
+    {
+      "id": 38,
+      "seek": 0,
+      "start": 94.341,
+      "end": 96.363,
+      "text": "You don't have the cards rightnow.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 39,
+      "seek": 0,
+      "start": 96.943,
+      "end": 98.864,
+      "text": "Withus, you start havingcards.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 40,
+      "seek": 0,
+      "start": 98.925,
+      "end": 101.246,
+      "text": "Rightnow, you're playingcards.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 41,
+      "seek": 0,
+      "start": 101.286,
+      "end": 102.447,
+      "text": "You're playingcards.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 42,
+      "seek": 0,
+      "start": 102.467,
+      "end": 105.089,
+      "text": "You're gambling with the lives of millions ofpeople.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 43,
+      "seek": 0,
+      "start": 105.449,
+      "end": 107.971,
+      "text": "You're gambling with World WarIII.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 44,
+      "seek": 0,
+      "start": 108.011,
+      "end": 110.373,
+      "text": "You're gambling with World WarIII.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 45,
+      "seek": 0,
+      "start": 111.033,
+      "end": 112.374,
+      "text": "And what you're doing is very",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 46,
+      "seek": 0,
+      "start": 112.975,
+      "end": 115.697,
+      "text": "disrespectful to thecountry, thiscountry.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 47,
+      "seek": 0,
+      "start": 116.137,
+      "end": 117.318,
+      "text": "It's back toyou.",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 48,
+      "seek": 0,
+      "start": 117.578,
+      "end": 120.18,
+      "text": "Far more than a lot of people said they shouldhave.",
+      "speaker": "SPEAKER_01"
+    },
+    {
+      "id": 49,
+      "seek": 0,
+      "start": 120.24,
+      "end": 121.501,
+      "text": "Have you said thank youonce?",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 50,
+      "seek": 0,
+      "start": 121.961,
+      "end": 122.902,
+      "text": "A lot oftimes.",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 51,
+      "seek": 0,
+      "start": 123.543,
+      "end": 124.445,
+      "text": "Even",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 52,
+      "seek": 0,
+      "start": 125.326,
+      "end": 129.391,
+      "text": "today. You went to Pennsylvania and campaigned for the opposition inOctober.",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 53,
+      "seek": 0,
+      "start": 129.812,
+      "end": 136.1,
+      "text": "Offer some words of appreciation for the United States of America and the president who's trying to save your",
+      "speaker": "SPEAKER_00"
+    },
+    {
+      "id": 54,
+      "seek": 0,
+      "start": 136.421,
+      "end": 136.841,
+      "text": "country.",
+      "speaker": "SPEAKER_00"
+    }
+  ]
+}
