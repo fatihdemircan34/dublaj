@@ -1,0 +1,106 @@
+[tool.poetry]
+name = "mp4-diarize-pipeline"
+version = "0.1.0"
+description = "MP4 -> VAD/OSD/Diarization/(Separation) + Whisper ASR; overlap-aware konuşmacı atama ve JSON çıktı."
+authors = ["Fatih <fatidemircan@gmail.com>"]
+readme = "README.md"
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+
+# ====================================================================
+# ÇÖZÜM: Modern Versiyon Seti (Torchaudio Uyumlu)
+# ====================================================================
+# Bu konfigürasyon, tüm paketlerin birbirleriyle uyumlu
+# modern versiyonlarını kullanır. Test edilmiş ve çalışıyor.
+
+# Ana paketler - modern ve uyumlu versiyonlar
+pyannote-audio = "==3.1.1"  # Torchaudio 2.x ile uyumlu versiyon
+pyannote-core = "==5.0.0"
+pyannote-metrics = "==3.2.1"
+
+# PyTorch ekosistemi - uyumlu versiyonlar
+torch = "==2.1.0"  # Sabit versiyon, test edilmiş
+torchaudio = "==2.1.0"  # torch ile aynı versiyon numarası önemli!
+torchvision = "==0.16.0"  # Opsiyonel ama uyumluluk için
+anthropic = "^0.25.0"
+# ASR ve ses işleme
+faster-whisper = "==1.0.3"
+numpy = "==1.26.4"  # Modern ama stabil
+scipy = "==1.11.4"  # Ses işleme için
+soundfile = "==0.12.1"
+librosa = "==0.10.1"  # Ses analizi için
+ffmpeg-python = "==0.2.0"
+
+# HuggingFace ekosistemi
+huggingface-hub = "==0.24.0"
+transformers = "==4.36.0"  # Model yükleme için
+speechbrain = "==0.5.16"  # Alternatif VAD için
+
+# Diğer gerekli paketler
+omegaconf = "==2.3.0"  # Konfigürasyon yönetimi
+asteroid-filterbanks = "==0.4.0"  # Pyannote bağımlılığı
+einops = "==0.7.0"  # Tensor işlemleri
+
+# NOT: Brouhaha'yı şimdilik kaldırdım çünkü uyumsuzluk yaratıyor
+# Eğer brouhaha kullanmak isterseniz, alternatif çözüme bakın
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.5.0"
+black = "^24.4.2"
+isort = "^5.13.2"
+mypy = "^1.10.0"
+pytest = "^8.0.0"
+ipython = "^8.18.0"  # Debug için
+httpx="0.28.1"
+[tool.poetry.scripts]
+mp4-diarize = "mp4_diarize_pipeline:main"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
+
+# ====================================================================
+# KURULUM REHBERİ - ADIM ADIM
+# ====================================================================
+#
+# 1. TEMİZLİK (Çok Önemli!)
+#    ```bash
+#    # Önce her şeyi temizleyin
+#    deactivate  # Eğer sanal ortamdaysanız
+#    rm -rf .venv
+#    rm -f poetry.lock
+#    poetry cache clear pypi --all
+#    ```
+#
+# 2. PYTHON VERSİYON KONTROLÜ
+#    ```bash
+#    python3 --version  # 3.10, 3.11 veya 3.12 olmalı
+#    ```
+#
+# 3. YENİ KURULUM
+#    ```bash
+#    poetry install
+#    ```
+#
+# 4. CUDA KONTROLÜ (GPU varsa)
+#    ```bash
+#    poetry run python -c "import torch; print(torch.cuda.is_available())"
+#    ```
+#
+# 5. TOKEN AYARI
+#    ```bash
+#    export HF_TOKEN="your-huggingface-token"
+#    ```
+#
+# 6. TEST
+#    ```bash
+#    poetry run python -c "from pyannote.audio import Pipeline; print('Başarılı!')"
+#    ```
+#
+# SORUN GİDERME:
+# - Eğer CUDA hatası alırsanız: torch'u CPU versiyonu ile değiştirin
+# - Eğer bellek hatası alırsanız: batch_size'ı küçültün
+# - Eğer model indirme hatası alırsanız: HF_TOKEN'ı kontrol edin
+# ====================================================================
