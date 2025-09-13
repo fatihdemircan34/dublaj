@@ -8,7 +8,8 @@ license = "MIT"
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.13"
-
+pydub = "0.25.1"
+openai="1.107.2"
 # ====================================================================
 # ÇÖZÜM: Modern Versiyon Seti (Torchaudio Uyumlu)
 # ====================================================================
@@ -24,7 +25,7 @@ pyannote-metrics = "==3.2.1"
 torch = "==2.1.0"  # Sabit versiyon, test edilmiş
 torchaudio = "==2.1.0"  # torch ile aynı versiyon numarası önemli!
 torchvision = "==0.16.0"  # Opsiyonel ama uyumluluk için
-anthropic = "^0.25.0"
+anthropic = "^0.61.0"
 # ASR ve ses işleme
 faster-whisper = "==1.0.3"
 numpy = "==1.26.4"  # Modern ama stabil
@@ -38,6 +39,10 @@ huggingface-hub = "==0.24.0"
 transformers = "==4.36.0"  # Model yükleme için
 speechbrain = "==0.5.16"  # Alternatif VAD için
 
+# Google Cloud paketleri
+google-cloud-speech = "^2.21.0"
+google-cloud-storage = "^2.10.0"
+
 # Diğer gerekli paketler
 omegaconf = "==2.3.0"  # Konfigürasyon yönetimi
 asteroid-filterbanks = "==0.4.0"  # Pyannote bağımlılığı
@@ -45,6 +50,7 @@ einops = "==0.7.0"  # Tensor işlemleri
 
 # NOT: Brouhaha'yı şimdilik kaldırdım çünkü uyumsuzluk yaratıyor
 # Eğer brouhaha kullanmak isterseniz, alternatif çözüme bakın
+requests = "^2.32.5"
 
 [tool.poetry.group.dev.dependencies]
 ruff = "^0.5.0"

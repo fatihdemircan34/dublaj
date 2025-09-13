@@ -1,1525 +1,1070 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-=============================================================================
-SES DOSYASI DİARİZASYON VE TRANSKRİPSİYON SİSTEMİ
-=============================================================================
-
-Bu program şunları yapar:
-1. Ses dosyasını (MP4/MP3/WAV) alır
-2. Kimin ne zaman konuştuğunu tespit eder (diarizasyon)
-3. Konuşulanları metne döker (transkripsiyon)
-4. Her kelimeyi doğru konuşmacıya atar
-5. Anlamlı cümle segmentleri oluşturur
-
-Kullanılan teknolojiler:
-- PyAnnote: Konuşmacı tespiti için
-- Whisper: Konuşma tanıma için
-- FFmpeg: Ses formatı dönüşümü için
-=============================================================================
-"""
-
-import httpx
-import sys
-import json
-import tempfile
-import argparse
-import subprocess
-import logging
-from typing import List, Dict, Optional, Tuple
-from collections import defaultdict
-from bisect import insort
-from datetime import datetime
-
-import anthropic
-import json
-import os
-
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Tuple, Set
 import numpy as np
-from pyannote.audio import Model, Pipeline
-from pyannote.audio.pipelines import VoiceActivityDetection, OverlappedSpeechDetection
-from pyannote.core import Segment, Timeline, Annotation
-from faster_whisper import WhisperModel
+import copy
+from collections import defaultdict, Counter
 import warnings
-
-warnings.filterwarnings("ignore", message=".*torchaudio.*deprecated.*")
-
-# ========================= DEBUG LOGGER KURULUMU =========================
-
-class ColoredFormatter(logging.Formatter):
-    """Renkli log çıktıları için özel formatter"""
-
-    COLORS = {
-        'DEBUG': '\033[36m',     # Cyan
-        'INFO': '\033[32m',      # Green
-        'WARNING': '\033[33m',   # Yellow
-        'ERROR': '\033[31m',     # Red
-        'CRITICAL': '\033[35m',  # Magenta
-    }
-    RESET = '\033[0m'
-    BOLD = '\033[1m'
-
-    def format(self, record):
-        log_color = self.COLORS.get(record.levelname, self.RESET)
-        record.levelname = f"{log_color}{self.BOLD}[{record.levelname}]{self.RESET}"
-        record.msg = f"{log_color}{record.msg}{self.RESET}"
-        return super().format(record)
-
-def setup_logger(debug_level: str = "INFO", log_file: Optional[str] = None):
-    """
-    Debug logger'ı yapılandır
-
-    debug_level: DEBUG, INFO, WARNING, ERROR, CRITICAL
-    log_file: Log dosyası yolu (opsiyonel)
-    """
-    logger = logging.getLogger('diarization')
-    logger.setLevel(getattr(logging, debug_level.upper()))
-
-    # Console handler (renkli)
-    console_handler = logging.StreamHandler()
-    console_formatter = ColoredFormatter(
-        '%(asctime)s %(levelname)s %(funcName)s:%(lineno)d - %(message)s',
-        datefmt='%H:%M:%S'
-    )
-    console_handler.setFormatter(console_formatter)
-    logger.addHandler(console_handler)
-
-    # File handler (opsiyonel)
-    if log_file:
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        file_formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
-        )
-        file_handler.setFormatter(file_formatter)
-        logger.addHandler(file_handler)
-
-    return logger
-
-# Global logger
-logger = logging.getLogger('diarization')
-
-# ========================= YARDIMCI FONKSİYONLAR =========================
-
-def format_time(seconds: float) -> str:
-    """Saniyeyi okunabilir formata çevir (MM:SS.mmm)"""
-    minutes = int(seconds // 60)
-    secs = seconds % 60
-    return f"{minutes:02d}:{secs:06.3f}"
-
-def round3(x: Optional[float]) -> Optional[float]:
-    """Sayıyı 3 ondalık basamağa yuvarla"""
-    if x is None:
-        return None
-    result = round(x, 3)
-    logger.debug(f"Yuvarlama: {x:.6f} → {result:.3f}")
-    return result
-
-def log_segment(seg: Segment, label: str = "Segment"):
-    """Segment bilgilerini logla"""
-    logger.debug(f"{label}: [{format_time(seg.start)} - {format_time(seg.end)}] "
-                 f"(Süre: {seg.duration:.3f}s)")
-
-def log_timeline(timeline: Timeline, label: str = "Timeline"):
-    """Timeline bilgilerini logla"""
-    total_duration = sum(s.duration for s in timeline)
-    logger.info(f"{label}: {len(timeline)} segment, "
-                f"Toplam süre: {total_duration:.2f}s")
-
-    if logger.level <= logging.DEBUG:
-        for i, seg in enumerate(timeline[:5]):  # İlk 5 segmenti göster
-            log_segment(seg, f"  Segment {i+1}")
-        if len(timeline) > 5:
-            logger.debug(f"  ... ve {len(timeline)-5} segment daha")
-
-# ========================= SES DÖNÜŞTÜRME =========================
-
-def ffmpeg_to_wav_mono16k(src_path: str) -> str:
-    """
-    Ses dosyasını işlenebilir formata çevir
-
-    NEDEN GEREKLİ?
-    - PyAnnote ve Whisper modelleri 16kHz mono WAV formatında çalışır
-    - MP4/MP3 gibi formatlar direkt işlenemez
-    - Stereo ses mono'ya çevrilmeli (tek kanal)
-
-    Args:
-        src_path: Kaynak ses dosyası (MP4, MP3, WAV, vb.)
-
-    Returns:
-        Dönüştürülmüş WAV dosyasının yolu
-    """
-    logger.info(f"Ses dosyası dönüştürülüyor: {src_path}")
-
-    # Dosya kontrolü
-    if not os.path.exists(src_path):
-        logger.error(f"Dosya bulunamadı: {src_path}")
-        raise FileNotFoundError(f"Girdi dosyası bulunamadı: {src_path}")
-
-    file_size = os.path.getsize(src_path) / (1024 * 1024)  # MB
-    logger.info(f"Dosya boyutu: {file_size:.2f} MB")
-
-    # Geçici WAV dosyası oluştur
-    tmp_wav = tempfile.mktemp(suffix=".wav")
-    logger.debug(f"Geçici dosya: {tmp_wav}")
-
-    # FFmpeg komutu
-    cmd = [
-        "ffmpeg", "-y",           # Evet, üzerine yaz
-        "-i", src_path,           # Girdi dosyası
-        "-ac", "1",               # Audio channels: 1 (mono)
-        "-ar", "16000",           # Audio rate: 16kHz
-        "-vn",                    # Video no (videoyu dahil etme)
-        "-f", "wav",              # Format: WAV
-        tmp_wav                   # Çıktı dosyası
-    ]
-
-    logger.debug(f"FFmpeg komutu: {' '.join(cmd)}")
-
-    try:
-        # FFmpeg'i çalıştır
-        result = subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True
-        )
-
-        # Dönüştürülen dosya boyutu
-        wav_size = os.path.getsize(tmp_wav) / (1024 * 1024)
-        logger.info(f"✓ Dönüştürme tamamlandı. WAV boyutu: {wav_size:.2f} MB")
-
-        # FFmpeg çıktısını debug modunda göster
-        if result.stderr and logger.level <= logging.DEBUG:
-            logger.debug("FFmpeg çıktısı:")
-            for line in result.stderr.split('\n')[:10]:
-                if line.strip():
-                    logger.debug(f"  {line}")
-
-    except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg hatası: {e}")
-        logger.error(f"Hata çıktısı: {e.stderr if hasattr(e, 'stderr') else 'N/A'}")
-        raise RuntimeError(f"FFmpeg dönüştürme hatası: {e}")
-
-    return tmp_wav
-
-# ========================= TIMELINE İŞLEMLERİ =========================
-
-def timeline_to_dict(tl: Timeline) -> List[Dict]:
-    """Timeline nesnesini JSON'a yazılabilir formata çevir"""
-    result = []
-    for seg in tl:
-        result.append({
-            "start": round3(seg.start),
-            "end": round3(seg.end),
-            "duration": round3(seg.duration)
-        })
-
-    logger.debug(f"Timeline → Dict: {len(tl)} segment dönüştürüldü")
-    return result
-
-def diarization_to_dict(di: Annotation) -> List[Dict]:
-    """Diarization sonuçlarını JSON formatına çevir"""
-    result = []
-    speaker_times = defaultdict(float)  # Her konuşmacının toplam süresi
-
-    for turn, _, label in di.itertracks(yield_label=True):
-        result.append({
-            "start": round3(turn.start),
-            "end": round3(turn.end),
-            "duration": round3(turn.duration),
-            "speaker": label
-        })
-        speaker_times[label] += turn.duration
-
-    # Konuşmacı istatistikleri
-    logger.info(f"Konuşmacı istatistikleri:")
-    for speaker, duration in sorted(speaker_times.items()):
-        logger.info(f"  {speaker}: {duration:.1f}s ({duration/60:.1f} dakika)")
-
-    return result
-
-def timeline_coverage_ratio(timeline: Timeline, seg: Segment) -> float:
-    """
-    Bir segmentin timeline tarafından ne kadar kaplandığını hesapla
-
-    KULLANIM AMACI:
-    VAD (Voice Activity Detection) kontrolü için kullanılır.
-    Bir kelimenin gerçekten konuşma içinde mi yoksa sessizlikte mi
-    olduğunu anlamak için.
-    """
-    if seg.duration <= 0:
-        return 0.0
-
-    covered = 0.0
-    overlaps = []
-
-    for t in timeline:
-        intersection = t & seg  # Kesişim
-        if intersection is not None:
-            covered += intersection.duration
-            overlaps.append(intersection)
-
-    ratio = min(1.0, covered / seg.duration)
-
-    if logger.level <= logging.DEBUG and overlaps:
-        logger.debug(f"Kapsama hesabı: Segment [{format_time(seg.start)}-{format_time(seg.end)}]")
-        logger.debug(f"  {len(overlaps)} kesişim, Kapsama: {ratio:.2%}")
-
-    return ratio
-
-def timeline_overlaps(timeline: Timeline, seg: Segment) -> bool:
-    """Segment ile timeline'ın kesişip kesişmediğini kontrol et"""
-    for t in timeline:
-        if (t & seg) is not None:
-            logger.debug(f"Çakışma tespit edildi: [{format_time(seg.start)}-{format_time(seg.end)}]")
-            return True
-    return False
-
-def intersect_timelines(t1: Timeline, t2: Timeline) -> Timeline:
-    """
-    İki timeline'ın kesişimini bul
-
-    KULLANIM AMACI:
-    Farklı algılama sistemlerinin (VAD, OSD, Diarization) sonuçlarını
-    birleştirerek daha güvenilir çakışma bölgeleri bulmak için.
-    """
-    logger.debug(f"Timeline kesişimi hesaplanıyor: "
-                 f"T1({len(t1)} seg) ∩ T2({len(t2)} seg)")
-
-    intersections = []
-    for a in t1:
-        for b in t2:
-            ab = a & b
-            if ab is not None and ab.duration > 0:
-                intersections.append(ab)
-
-    result = Timeline(intersections).support() if intersections else Timeline()
-    logger.debug(f"Kesişim sonucu: {len(result)} segment")
-
-    return result
-
-def build_overlap_from_diarization(diar: Annotation, min_count: int = 2) -> Timeline:
-    """
-    Diarization'dan çakışan konuşma bölgelerini tespit et
-
-    NASIL ÇALIŞIR?
-    1. Tüm konuşma başlangıç ve bitişlerini topla
-    2. Zaman çizgisinde ilerle
-    3. Her noktada kaç kişi konuşuyor say
-    4. 2+ kişi konuşuyorsa = çakışma
-
-    Bu "sweep line algoritması" olarak bilinir.
-    """
-    logger.info("Çakışan konuşma bölgeleri tespit ediliyor...")
-
-    # Tüm zaman noktalarını topla
-    # +1 = konuşma başlıyor, -1 = konuşma bitiyor
-    bounds = []
-    for turn, _, label in diar.itertracks(yield_label=True):
-        insort(bounds, (turn.start, +1))  # Başlangıç
-        insort(bounds, (turn.end, -1))    # Bitiş
-
-    logger.debug(f"Toplam {len(bounds)} zaman noktası işlenecek")
-
-    # Zaman çizgisinde ilerleyerek çakışmaları bul
-    overlaps = []
-    active_count = 0  # Şu anda konuşan kişi sayısı
-    prev_time = None
-
-    for time, delta in bounds:
-        # Eğer 2+ kişi konuşuyorsa, bu aralığı çakışma olarak kaydet
-        if prev_time is not None and time > prev_time and active_count >= min_count:
-            overlap_seg = Segment(prev_time, time)
-            overlaps.append(overlap_seg)
-
-            if logger.level <= logging.DEBUG:
-                logger.debug(f"  Çakışma: [{format_time(prev_time)}-{format_time(time)}] "
-                             f"({active_count} konuşmacı)")
-
-        active_count += delta
-        prev_time = time
-
-    result = Timeline(overlaps).support() if overlaps else Timeline()
-    logger.info(f"✓ {len(result)} çakışma bölgesi bulundu")
-
-    return result
-
-# ========================= MODEL YÜKLEYİCİLER =========================
-
-def build_vad(hf_token: str, onset=0.5, offset=0.5,
-              min_on=0.0, min_off=0.0):
-    """
-    Voice Activity Detection (VAD) - PyAnnote 3.1.1 Uyumlu
-    """
-    logger.info("VAD yapılandırılıyor (PyAnnote 3.1.1)...")
-
-    try:
-        from pyannote.audio import Model
-        from pyannote.audio.pipelines import VoiceActivityDetection
-
-        logger.info("Segmentation modeli yükleniyor...")
-
-        # PyAnnote 3.x model ismi
-        model = Model.from_pretrained(
-            "pyannote/segmentation-3.0",
-            use_auth_token=hf_token
-        )
-        logger.info("✓ Segmentation modeli yüklendi")
-
-        # VAD pipeline oluştur
-        vad = VoiceActivityDetection(segmentation=model)
-
-        # PyAnnote 3.x parametreleri - onset/offset YOK!
-        HYPER_PARAMETERS = {
-            "min_duration_on": min_on,    # onset yerine bu
-            "min_duration_off": min_off,   # offset yerine bu
-        }
-
-        try:
-            vad.instantiate(HYPER_PARAMETERS)
-            logger.info("✓ VAD parametreleri ayarlandı")
-        except Exception as e:
-            logger.warning(f"Parametreler uygulanamadı: {e}")
-            logger.info("Varsayılan parametrelerle devam ediliyor...")
-            vad.instantiate({})  # Boş dict ile başlat
-
-        logger.info("✓ VAD sistemi hazır")
-        return vad
-
-    except Exception as e:
-        logger.error(f"VAD modeli yüklenemedi: {e}")
-        logger.warning("Alternatif: Diarization tabanlı VAD kullanılacak")
-
-        class DiarizationBasedVAD:
-            def __init__(self):
-                self.is_fallback = True
-                self.vad_timeline = None
-                logger.info("DiarizationBasedVAD yedek sistemi aktif")
-
-            def __call__(self, wav_path):
-                logger.info("VAD bilgisi diarization'dan çıkarılacak")
-                from pyannote.core import Timeline
-                return Timeline()
-
-        return DiarizationBasedVAD()
-
-def build_osd(hf_token: str, min_on=0.10, min_off=0.10) -> OverlappedSpeechDetection:
-    """
-    Overlapped Speech Detection (OSD) modeli oluştur
-
-    OSD NEDİR?
-    İki veya daha fazla kişinin aynı anda konuştuğu bölümleri tespit eder.
-    Kesişen konuşmaları bulmak kritik çünkü bu bölgelerde
-    konuşmacı ataması zor ve hata payı yüksek.
-    """
-    logger.info("OSD (Çakışan Konuşma) modeli yükleniyor...")
-    logger.debug(f"Parametreler: min_on={min_on}, min_off={min_off}")
-
-    try:
-        seg_model = Model.from_pretrained(
-            "pyannote/segmentation-3.0",
-            use_auth_token=hf_token
-        )
-        logger.info("✓ OSD modeli yüklendi")
-
-        osd = OverlappedSpeechDetection(segmentation=seg_model)
-        osd.instantiate({
-            "min_duration_on": min_on,
-            "min_duration_off": min_off
-        })
-
-        return osd
-
-    except Exception as e:
-        logger.error(f"OSD modeli yüklenemedi: {e}")
-        raise
-
-def build_diarization(hf_token: str,
-                      min_speakers: Optional[int] = None,
-                      max_speakers: Optional[int] = None) -> Pipeline:
-    """
-    Speaker Diarization Pipeline - PyAnnote 3.1.1 Uyumlu
-    """
-    logger.info("Diarization pipeline yükleniyor (PyAnnote 3.1.1)...")
-
-    if min_speakers:
-        logger.info(f"Minimum konuşmacı sayısı: {min_speakers}")
-    if max_speakers:
-        logger.info(f"Maksimum konuşmacı sayısı: {max_speakers}")
-
-    try:
-        from pyannote.audio import Pipeline
-
-        pipe = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=hf_token
-        )
-
-        logger.info("✓ Diarization pipeline yüklendi")
-
-        # PyAnnote 3.x'te instantiate() boş dict alıyor
-        pipe.instantiate({})
-
-        # min/max speakers için wrapper
-        if min_speakers is not None or max_speakers is not None:
-            class ParameterizedDiarization:
-                def __init__(self, pipeline, min_spk, max_spk):
-                    self.pipeline = pipeline
-                    self.min_speakers = min_spk
-                    self.max_speakers = max_spk
-
-                def __call__(self, audio_file, **kwargs):
-                    if self.min_speakers is not None:
-                        kwargs['min_speakers'] = self.min_speakers
-                    if self.max_speakers is not None:
-                        kwargs['max_speakers'] = self.max_speakers
-                    return self.pipeline(audio_file, **kwargs)
-
-            logger.info(f"Konuşmacı limitleri ayarlandı")
-            return ParameterizedDiarization(pipe, min_speakers, max_speakers)
-
-        return pipe
-
-    except Exception as e:
-        logger.error(f"Diarization pipeline yüklenemedi: {e}")
-        raise RuntimeError(f"Diarization başlatılamadı: {e}")
-
-# ========================= KONUŞMACI ATAMA LOJİĞİ =========================
-
-# Konuşmacı atama parametreleri (fine-tuning için)
-SMOOTH_WIN = 0.05      # 50ms pencere - çok hızlı konuşmacı değişimlerini yumuşatır
-STICKY_RATIO = 0.5     # Önceki konuşmacıya yapışma - gürültüyü azaltır
-LOCAL_TURN_BIAS = 0.6  # Kısa konuşmalara öncelik - kesintileri yakalar
-
-def assign_speaker_midwin(diar: Annotation,
-                          word_seg: Segment,
-                          prev_spk: Optional[str],
-                          is_overlap: bool) -> Tuple[str, float]:
-    """
-    Kelime segmentine en uygun konuşmacıyı ata
-
-    NASIL ÇALIŞIR?
-    1. Kelimenin orta noktası etrafında küçük bir pencere aç
-    2. Bu pencerede en çok konuşan kişiyi bul
-    3. Çakışma varsa özel stratejiler uygula
-    4. Güven skoru hesapla
-
-    STRATEJİLER:
-    - Normal durumda: En çok konuşan kazanır
-    - Çakışmada: Kısa/keskin konuşmalara öncelik
-    - Belirsizlikte: Önceki konuşmacıya yapış
-    """
-    # Kelimenin orta noktası
-    tmid = (word_seg.start + word_seg.end) / 2
-
-    # Analiz penceresi
-    win = Segment(max(0.0, tmid - SMOOTH_WIN), tmid + SMOOTH_WIN)
-
-    logger.debug(f"Kelime [{format_time(word_seg.start)}-{format_time(word_seg.end)}] "
-                 f"için konuşmacı atanıyor")
-    logger.debug(f"  Analiz penceresi: [{format_time(win.start)}-{format_time(win.end)}]")
-
-    # Penceredeki her konuşmacının konuşma süresi
-    scores = defaultdict(float)
-    total = 0.0
-    active_at_mid = []  # Orta noktada aktif konuşmacılar
-
-    for turn, _, label in diar.itertracks(yield_label=True):
-        # Pencere ile kesişim
-        inter = turn & win
-        if inter is not None:
-            duration = inter.duration
-            scores[label] += duration
-            total += duration
-            logger.debug(f"    {label}: {duration:.3f}s")
-
-        # Orta noktada aktif mi?
-        if turn.start <= tmid < turn.end:
-            active_at_mid.append((turn, label))
-
-    # Hiç skor yoksa (nadir durum)
-    if not scores:
-        logger.warning("Pencerede konuşmacı bulunamadı, tam kesişime bakılıyor")
-
-        best_label = "SPEAKER_00"
-        best_duration = 0.0
-
-        for turn, _, label in diar.itertracks(yield_label=True):
-            inter = turn & word_seg
-            if inter is not None and inter.duration > best_duration:
-                best_duration = inter.duration
-                best_label = label
-
-        confidence = min(1.0, best_duration / max(1e-6, word_seg.duration))
-        logger.debug(f"  Sonuç: {best_label} (güven: {confidence:.2%})")
-        return best_label, confidence
-
-    # ÇAKIŞMA STRATEJİSİ
-    if is_overlap and len(active_at_mid) >= 2:
-        logger.debug("  ⚠ Çakışma tespit edildi, özel strateji uygulanıyor")
-
-        # Konuşmaları sürelerine göre sırala
-        active_at_mid.sort(key=lambda x: x[0].duration)
-        short_turn, short_label = active_at_mid[0]
-        long_turn, _ = active_at_mid[-1]
-
-        # Kısa konuşma muhtemelen kesinti/müdahale
-        if short_turn.duration <= LOCAL_TURN_BIAS * long_turn.duration:
-            confidence = min(1.0, scores.get(short_label, 0) / max(total, 1e-6))
-            logger.debug(f"  Kısa konuşmaya öncelik: {short_label} "
-                         f"({short_turn.duration:.2f}s < {LOCAL_TURN_BIAS}*{long_turn.duration:.2f}s)")
-            return short_label, confidence
-
-    # NORMAL DURUM: En yüksek skoru seç
-    candidate = max(scores.items(), key=lambda kv: kv[1])[0]
-    confidence = min(1.0, scores[candidate] / max(total, 1e-6))
-
-    logger.debug(f"  En yüksek skor: {candidate} ({scores[candidate]:.3f}s / {total:.3f}s)")
-
-    # YAPIŞTIRMA STRATEJİSİ (smoothing)
-    if is_overlap and prev_spk and candidate != prev_spk:
-        prev_score = scores.get(prev_spk, 0.0)
-        if scores[candidate] < STICKY_RATIO * prev_score:
-            logger.debug(f"  Önceki konuşmacıya yapışılıyor: {prev_spk} "
-                         f"({scores[candidate]:.3f} < {STICKY_RATIO}*{prev_score:.3f})")
-            candidate = prev_spk
-
-    logger.debug(f"  ✓ Sonuç: {candidate} (güven: {confidence:.2%})")
-    return candidate, confidence
-
-# ========================= ASR (KONUŞMA TANIMA) =========================
-
-def transcribe_words(asr: WhisperModel,
-                     audio_path: str,
-                     lang: Optional[str]) -> List[Dict]:
-    """
-    Ses dosyasını metne çevir ve kelime zaman damgalarını al
-
-    WHISPER NEDİR?
-    OpenAI'ın geliştirdiği, 680.000 saat ses verisiyle eğitilmiş
-    çok dilli konuşma tanıma modeli. 100+ dili destekler.
-
-    KELİME ZAMAN DAMGALARI:
-    Her kelimenin tam olarak ne zaman söylendiğini milisaniye
-    hassasiyetinde tespit eder. Bu, konuşmacı ataması için kritik.
-    """
-    # Model bilgisini güvenli şekilde al
-    # faster-whisper'da model boyutu farklı saklanıyor
-    model_info = "Whisper Model"  # Varsayılan
-    try:
-        # Farklı olası attribute isimlerini dene
-        if hasattr(asr, 'model_size'):
-            model_info = asr.model_size
-        elif hasattr(asr, 'model'):
-            model_info = str(asr.model)
-        else:
-            # Model bilgisi bulunamazsa, sadece "Whisper" yaz
-            model_info = "Whisper"
-    except:
+warnings.filterwarnings('ignore')
+
+# Existing timeline tools and optimized speaker mapper from previous code
+from pathlib import Path
+import os
+import json
+import csv
+import math
+import time
+import shutil
+import subprocess
+import requests
+from openai import OpenAI
+try:
+    from openai import BadRequestError
+except Exception:
+    class BadRequestError(Exception):
         pass
 
-    logger.info(f"Transkripsiyon başlıyor... (Model: {model_info})")
-    if lang:
-        logger.info(f"Dil: {lang}")
+# ------------------ Timeline araçları ------------------
 
-    start_time = datetime.now()
+@dataclass(frozen=True)
+class DiarSeg:
+    start: float
+    end: float
+    speaker: str
 
-    # Transkripsiyon parametreleri
-    segments, info = asr.transcribe(
-        audio_path,
-        task="transcribe",           # "translate" değil, orijinal dilde tut
-        vad_filter=False,            # VAD'yi kendimiz yapıyoruz
-        word_timestamps=True,        # ⚠ KRİTİK: Kelime zamanlamaları
-        beam_size=10,                # Daha yüksek = daha doğru ama yavaş
-        temperature=0.0,             # 0 = deterministik (tutarlı sonuçlar)
-        language=lang                # Dil tespitini atla, hızlandır
-    )
+@dataclass
+class TimelineSeg:
+    start: float
+    end: float
+    speakers: Tuple[str, ...]
+    mode: str
+    channels: Optional[Dict[str, str]] = None
 
-    # Tespit edilen dil bilgisini kontrol et
-    if hasattr(info, 'language') and info.language:
-        logger.info(f"Tespit edilen dil: {info.language}")
+def _midpoint(a: float, b: float) -> float:
+    return (a + b) / 2.0
 
-    # Kelimeleri topla
-    words = []
-    total_segments = 0
-    skipped_words = 0
-
-    for seg in segments:
-        total_segments += 1
-
-        if not seg.words:
-            logger.debug(f"Segment {total_segments}: Kelime yok, atlanıyor")
+def _normalize_segs(segs: List[Dict[str, Any]]) -> List[DiarSeg]:
+    out = []
+    for s in segs:
+        st = float(s["start"]); en = float(s["end"])
+        if en <= st:
             continue
+        out.append(DiarSeg(st, en, str(s["speaker"])))
+    return sorted(out, key=lambda x: (x.start, x.end))
 
-        logger.debug(f"Segment {total_segments}: {len(seg.words)} kelime")
+def _active_speakers_at(t: float, segs: List[DiarSeg]) -> List[str]:
+    return [s.speaker for s in segs if s.start <= t < s.end]
 
-        for word in seg.words:
-            # Zaman damgası olmayan kelimeleri atla
-            if word.start is None or word.end is None:
-                skipped_words += 1
-                logger.debug(f"  ⚠ Kelime atlandı (zaman yok): '{word.word}'")
-                continue
-
-            word_dict = {
-                "word": word.word.strip(),
-                "start": float(word.start),
-                "end": float(word.end),
-                "confidence": float(getattr(word, "probability", 0.9))
-            }
-
-            words.append(word_dict)
-
-            # İlk birkaç kelimeyi logla (debug modunda)
-            if len(words) <= 5 and logger.level <= logging.DEBUG:
-                logger.debug(f"  Kelime {len(words)}: '{word_dict['word']}' "
-                             f"[{format_time(word_dict['start'])}-{format_time(word_dict['end'])}] "
-                             f"(güven: {word_dict['confidence']:.2%})")
-
-    # İstatistikler
-    elapsed = (datetime.now() - start_time).total_seconds()
-    logger.info(f"✓ Transkripsiyon tamamlandı:")
-    logger.info(f"  Süre: {elapsed:.1f}s")
-    logger.info(f"  Segment: {total_segments}")
-    logger.info(f"  Kelime: {len(words)}")
-    if skipped_words > 0:
-        logger.warning(f"  Atlanan: {skipped_words} kelime (zaman damgası yok)")
-
-    return words
-
-
-
-def create_output_byspeaker(debug_dir: str, segments: List[Dict],
-                            speakers: List[str]) -> str:
-    """
-    Segmentleri konuşmacılara göre organize et ve ayrı bir dosya oluştur
-
-    Bu fonksiyon, ana çıktıdaki segmentleri alır ve her konuşmacının
-    ne dediğini ayrı ayrı gruplar. Kelime kelime değil, anlamlı
-    cümle/segment halinde organize eder.
-
-    Args:
-        debug_dir: Debug dosyalarının bulunduğu klasör
-        segments: Ana programdan gelen konuşma segmentleri (text içeren)
-        speakers: Tespit edilen konuşmacı listesi
-
-    Returns:
-        Oluşturulan dosyanın yolu
-    """
-    output_path = os.path.join(debug_dir, "output_byspeaker.json")
-
-    # Segmentleri konuşmacılara göre grupla
-    segments_by_speaker = defaultdict(list)
-
-    for segment in segments:
-        speaker = segment["speaker"]
-        # Her segmenti olduğu gibi ekle (text dahil)
-        segments_by_speaker[speaker].append({
-            "id": segment["id"],
-            "start": segment["start"],
-            "end": segment["end"],
-            "text": segment["text"],  # Birleştirilmiş metin
-            "duration": segment["duration"],
-            "word_count": segment["word_count"]
-        })
-
-    # Her konuşmacı için segmentleri zaman sırasına göre sırala
-    for speaker in segments_by_speaker:
-        segments_by_speaker[speaker].sort(key=lambda x: x["start"])
-
-    # Çıktı formatını oluştur
-    output_data = {
-        "description": "Konuşmacılara göre organize edilmiş segmentler",
-        "creation_time": datetime.now().isoformat(),
-        "speakers": speakers,
-        "total_segments": len(segments),
-        "segments_by_speaker": {}
-    }
-
-    # Her konuşmacı için detaylı bilgi oluştur
-    for speaker in speakers:
-        speaker_segments = segments_by_speaker.get(speaker, [])
-
-        if speaker_segments:
-            # İstatistikler
-            total_duration = sum(seg["duration"] for seg in speaker_segments)
-            total_words = sum(seg["word_count"] for seg in speaker_segments)
-            first_time = speaker_segments[0]["start"]
-            last_time = speaker_segments[-1]["end"]
-
-            # Tüm metinleri birleştir (opsiyonel - tam transkript için)
-            full_text = " ".join(seg["text"] for seg in speaker_segments)
-
-        else:
-            total_duration = 0
-            total_words = 0
-            first_time = None
-            last_time = None
-            full_text = ""
-
-        output_data["segments_by_speaker"][speaker] = {
-            "segment_count": len(speaker_segments),
-            "total_duration": round3(total_duration),
-            "total_words": total_words,
-            "first_time": round3(first_time) if first_time is not None else None,
-            "last_time": round3(last_time) if last_time is not None else None,
-            "segments": speaker_segments,  # Text içeren segmentler
-            "full_text": full_text  # Tüm konuşmaların birleşimi
-        }
-
-    # Genel istatistikler
-    total_duration_all = sum(
-        data["total_duration"]
-        for data in output_data["segments_by_speaker"].values()
-    )
-
-    output_data["statistics"] = {}
-    for speaker in speakers:
-        speaker_data = output_data["segments_by_speaker"][speaker]
-        output_data["statistics"][speaker] = {
-            "segment_percentage": round(
-                100 * speaker_data["segment_count"] / max(len(segments), 1), 2
-            ),
-            "duration_percentage": round(
-                100 * speaker_data["total_duration"] / max(total_duration_all, 1), 2
-            ),
-            "word_percentage": round(
-                100 * speaker_data["total_words"] /
-                max(sum(s["total_words"] for s in output_data["segments_by_speaker"].values()), 1), 2
-            )
-        }
-
-    # Dosyayı kaydet
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(output_data, f, ensure_ascii=False, indent=2)
-
-    logger.info(f"✓ Konuşmacı bazlı çıktı oluşturuldu: {output_path}")
-
-    # İstatistikleri logla
-    logger.info("Konuşmacı segment dağılımı:")
-    for speaker in speakers:
-        seg_count = output_data["segments_by_speaker"][speaker]["segment_count"]
-        duration = output_data["segments_by_speaker"][speaker]["total_duration"]
-        percentage = output_data["statistics"][speaker]["duration_percentage"]
-        logger.info(f"  {speaker}: {seg_count} segment, {duration:.1f}s ({percentage}%)")
-
-    return output_path
-
-
-
-
-# ========================= SEGMENT BİRLEŞTİRME =========================
-
-def merge_words_into_segments(tagged_words: List[Dict],
-                              max_gap: float = 0.6,
-                              max_len: float = 12.0) -> List[Dict]:
-    """
-    Kelimeleri anlamlı cümle segmentlerine birleştir
-
-    NEDEN GEREKLİ?
-    Kelime kelime çıktı okunması zor. İnsanlar cümleler halinde
-    konuşur. Bu fonksiyon kelimeleri doğal cümle yapılarına dönüştürür.
-
-    STRATEJİ:
-    - Aynı konuşmacının ardışık kelimeleri birleştir
-    - Uzun suskunlukta böl (max_gap)
-    - Çok uzun segmentleri böl (max_len)
-    """
-    if not tagged_words:
-        logger.warning("Birleştirilecek kelime yok")
+def build_flat_timeline(
+        diar_segments: List[Dict[str, Any]],
+        *,
+        stereo_threshold: float = 0.20,
+        epsilon: float = 1e-6
+) -> List[TimelineSeg]:
+    segs = _normalize_segs(diar_segments)
+    if not segs:
         return []
-
-    logger.info(f"Kelimeler cümlelere birleştiriliyor... "
-                f"({len(tagged_words)} kelime)")
-    logger.debug(f"Parametreler: max_gap={max_gap}s, max_len={max_len}s")
-
-    segments = []
-    current = None
-
-    for i, word in enumerate(tagged_words):
-        if current is None:
-            # İlk segment
-            current = {
-                "start": word["start"],
-                "end": word["end"],
-                "speaker": word["speaker"],
-                "words": [word["word"]],
-                "overlap_count": 1 if word.get("is_overlap") else 0
-            }
-            logger.debug(f"Yeni segment başladı: {word['speaker']} @ {format_time(word['start'])}")
+    cuts = sorted({s.start for s in segs} | {s.end for s in segs})
+    out: List[TimelineSeg] = []
+    for i in range(len(cuts) - 1):
+        a, b = cuts[i], cuts[i+1]
+        if b - a <= epsilon:
             continue
-
-        # Birleştirme kriterleri
-        same_speaker = (word["speaker"] == current["speaker"])
-        gap = word["start"] - current["end"]
-        total_length = word["end"] - current["start"]
-
-        gap_ok = gap <= max_gap
-        length_ok = total_length <= max_len
-
-        if logger.level <= logging.DEBUG and i < 10:  # İlk 10 kelime için detay
-            logger.debug(f"  Kelime {i}: '{word['word']}' - "
-                         f"Aynı konuşmacı: {same_speaker}, "
-                         f"Boşluk: {gap:.2f}s, "
-                         f"Toplam: {total_length:.2f}s")
-
-        if same_speaker and gap_ok and length_ok:
-            # Mevcut segmente ekle
-            current["end"] = word["end"]
-            current["words"].append(word["word"])
-            if word.get("is_overlap"):
-                current["overlap_count"] += 1
-        else:
-            # Yeni segment başlat
-            segments.append(current)
-
-            if not same_speaker:
-                logger.debug(f"Konuşmacı değişti: {current['speaker']} → {word['speaker']}")
-            elif not gap_ok:
-                logger.debug(f"Uzun boşluk: {gap:.2f}s > {max_gap}s")
-            elif not length_ok:
-                logger.debug(f"Segment çok uzun: {total_length:.2f}s > {max_len}s")
-
-            current = {
-                "start": word["start"],
-                "end": word["end"],
-                "speaker": word["speaker"],
-                "words": [word["word"]],
-                "overlap_count": 1 if word.get("is_overlap") else 0
-            }
-
-    # Son segmenti ekle
-    if current is not None:
-        segments.append(current)
-
-    logger.info(f"✓ {len(segments)} segment oluşturuldu")
-
-    # Formatla ve istatistikleri hesapla
-    formatted = []
-    speaker_segments = defaultdict(int)
-
-    for i, s in enumerate(segments):
-        overlap_ratio = s["overlap_count"] / len(s["words"])
-
-        formatted_seg = {
-            "id": i,
-            "start": round3(s["start"]),
-            "end": round3(s["end"]),
-            "text": " ".join(s["words"]).strip(),
-            "speaker": s["speaker"],
-            "duration": round3(s["end"] - s["start"]),
-            "word_count": len(s["words"]),
-            "overlap_ratio": round3(overlap_ratio)
-        }
-
-        formatted.append(formatted_seg)
-        speaker_segments[s["speaker"]] += 1
-
-        # İlk birkaç segmenti logla
-        if i < 3 and logger.level <= logging.DEBUG:
-            logger.debug(f"Segment {i}: {s['speaker']} "
-                         f"[{format_time(s['start'])}-{format_time(s['end'])}] "
-                         f"({len(s['words'])} kelime): "
-                         f"'{' '.join(s['words'][:5])}...'")
-
-    # Segment istatistikleri
-    logger.info("Segment dağılımı:")
-    for speaker, count in sorted(speaker_segments.items()):
-        logger.info(f"  {speaker}: {count} segment")
-
-    return formatted
-
-def filter_tiny_overlaps(overlap_tl: Timeline,
-                         min_duration: float = 0.5) -> Timeline:
-    """
-    Çok kısa çakışma bölgelerini filtrele
-
-    NEDEN?
-    Çok kısa çakışmalar genelde yanlış algılamadır.
-    0.5 saniyeden kısa çakışmalar muhtemelen gürültü.
-    """
-    logger.debug(f"Kısa çakışmalar filtreleniyor (min: {min_duration}s)")
-
-    original_count = len(overlap_tl)
-    filtered = []
-    removed = []
-
-    for seg in overlap_tl:
-        if seg.duration >= min_duration:
-            filtered.append(seg)
-        else:
-            removed.append(seg)
-
-    if removed:
-        logger.info(f"Filtrelenen çakışmalar: {len(removed)}/{original_count}")
-        for r in removed[:5]:  # İlk 5 tanesini göster
-            logger.debug(f"  Kaldırıldı: [{format_time(r.start)}-{format_time(r.end)}] "
-                         f"({r.duration:.3f}s)")
-
-    return Timeline(filtered).support() if filtered else Timeline()
-
-def post_merge_tiny_segments(segments: List[Dict],
-                             min_duration: float = 2.0,
-                             max_gap: float = 1.5) -> List[Dict]:
-    """
-    Çok kısa segmentleri komşularıyla birleştir
-
-    NEDEN?
-    Kısa segmentler (< 2s) genelde kesik cümlelerdir:
-    - "Evet." (0.5s)
-    - "Hmm..." (0.3s)
-    - "Peki." (0.4s)
-
-    Bunları bir sonraki segmentle birleştirmek daha doğal.
-    """
-    if not segments:
-        return segments
-
-    logger.info(f"Kısa segmentler birleştiriliyor (min: {min_duration}s)...")
-
-    merged = []
-    i = 0
-    merge_count = 0
-
-    while i < len(segments):
-        seg = segments[i]
-        duration = seg["end"] - seg["start"]
-
-        # Kısa segment ve sonraki segment varsa
-        if duration < min_duration and i + 1 < len(segments):
-            next_seg = segments[i + 1]
-            gap = next_seg["start"] - seg["end"]
-
-            # Birleştirme kriterleri
-            same_speaker = (seg["speaker"] == next_seg["speaker"])
-            gap_ok = gap <= max_gap
-
-            if same_speaker and gap_ok:
-                # Birleştir
-                merged_seg = {
-                    "id": len(merged),
-                    "start": seg["start"],
-                    "end": next_seg["end"],
-                    "text": seg["text"] + " " + next_seg["text"],
-                    "speaker": seg["speaker"],
-                    "duration": round3(next_seg["end"] - seg["start"]),
-                    "word_count": seg.get("word_count", 0) + next_seg.get("word_count", 0)
-                }
-
-                merged.append(merged_seg)
-                merge_count += 1
-
-                logger.debug(f"Birleştirildi: Segment {seg['id']} + {next_seg['id']} "
-                             f"({duration:.1f}s + {next_seg['end']-next_seg['start']:.1f}s)")
-
-                i += 2  # İki segmenti atla
-                continue
-
-        # Birleştirme yapılamadı
-        seg_copy = seg.copy()
-        seg_copy["id"] = len(merged)
-        merged.append(seg_copy)
-        i += 1
-
-    if merge_count > 0:
-        logger.info(f"✓ {merge_count} segment birleştirildi "
-                    f"({len(segments)} → {len(merged)} segment)")
-
-    return merged
-def create_output_byspeaker_from_tagged_words(debug_dir: str,
-                                              tagged_words: List[Dict],
-                                              speakers: List[str],
-                                              max_gap: float = 1.5,
-                                              max_len: float = 30.0) -> str:
-    """
-    Tagged words'den direkt konuşmacı bazlı çıktı oluştur
-
-    Args:
-        debug_dir: Debug dosyalarının bulunduğu klasör
-        tagged_words: Konuşmacı atamalı kelimeler
-        speakers: Tespit edilen konuşmacı listesi
-        max_gap: Segment birleştirme için maksimum boşluk (saniye)
-        max_len: Maksimum segment uzunluğu (saniye)
-
-    Returns:
-        Oluşturulan dosyanın yolu
-    """
-    output_path = os.path.join(debug_dir, "output_byspeaker.json")
-
-    # Her konuşmacı için kelimeleri segmentlere dönüştür
-    segments_by_speaker = {}
-
-    for speaker in speakers:
-        # Bu konuşmacıya ait kelimeleri filtrele
-        speaker_words = [w for w in tagged_words if w["speaker"] == speaker]
-
-        if not speaker_words:
-            segments_by_speaker[speaker] = {"segments": []}
+        mid = _midpoint(a, b)
+        active = sorted(set(_active_speakers_at(mid, segs)))
+        if not active:
             continue
+        if len(active) == 1:
+            seg = TimelineSeg(a, b, (active[0],), "mono")
+        elif len(active) == 2 and (b - a) <= stereo_threshold:
+            L, R = active[0], active[1]
+            seg = TimelineSeg(a, b, (L, R), "stereo", channels={"L": L, "R": R})
+        else:
+            seg = TimelineSeg(a, b, tuple(active), "multi")
+        if out and out[-1].mode == seg.mode and out[-1].speakers == seg.speakers and abs(out[-1].end - seg.start) <= epsilon:
+            out[-1].end = seg.end
+        else:
+            out.append(seg)
+    return out
 
-        # Kelimeleri segmentlere birleştir
-        segments = []
-        current_segment = None
-        segment_id = 0
+def parse_simple_csv_lines(lines: List[str]) -> List[Dict[str, Any]]:
+    out = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        start_s, end_s, spk = [p.strip() for p in ln.split(",", 2)]
+        out.append({"start": float(start_s), "end": float(end_s), "speaker": spk})
+    return out
 
-        for word in speaker_words:
-            if current_segment is None:
-                # İlk segment
-                current_segment = {
-                    "id": segment_id,
-                    "start": round3(word["start"]),
-                    "end": round3(word["end"]),
-                    "words": [word["word"]],
-                    "speaker": speaker
-                }
-            else:
-                # Birleştirme kriterleri
-                gap = word["start"] - current_segment["end"]
-                total_length = word["end"] - current_segment["start"]
+# ------------------ OPTİMİZE EDİLMİŞ KONUŞMACI EŞLEME SİSTEMİ ------------------
 
-                if gap <= max_gap and total_length <= max_len:
-                    # Mevcut segmente ekle
-                    current_segment["end"] = round3(word["end"])
-                    current_segment["words"].append(word["word"])
-                else:
-                    # Yeni segment başlat
-                    # Önce mevcut segmenti kaydet
-                    current_segment["text"] = " ".join(current_segment["words"])
-                    current_segment["duration"] = round3(
-                        current_segment["end"] - current_segment["start"]
-                    )
-                    current_segment["word_count"] = len(current_segment["words"])
-                    del current_segment["words"]  # words alanını kaldır
-                    segments.append(current_segment)
+@dataclass
+class SegmentMetrics:
+    """Segment eşleştirme metrikleri"""
+    overlap_duration: float
+    overlap_ratio_stt: float
+    overlap_ratio_diar: float
+    iou: float
+    boundary_distance: float
+    confidence: float
 
-                    segment_id += 1
-                    current_segment = {
-                        "id": segment_id,
-                        "start": round3(word["start"]),
-                        "end": round3(word["end"]),
-                        "words": [word["word"]],
-                        "speaker": speaker
-                    }
+@dataclass
+class SpeakerCandidate:
+    """Konuşmacı adayı"""
+    speaker_id: str
+    metrics: SegmentMetrics
+    source: str
+    weight: float = 1.0
 
-        # Son segmenti ekle
-        if current_segment:
-            current_segment["text"] = " ".join(current_segment["words"])
-            current_segment["duration"] = round3(
-                current_segment["end"] - current_segment["start"]
+class OptimizedSpeakerMapper:
+    """
+    Gerçek veri odaklı optimize edilmiş konuşmacı eşleme sistemi.
+    """
+
+    def __init__(self,
+                 min_overlap_ratio: float = 0.2,
+                 boundary_tolerance: float = 0.1,
+                 min_segment_duration: float = 0.2,
+                 use_vad_boundaries: bool = True,
+                 use_timeline: bool = True,
+                 neighbor_window: int = 3,
+                 confidence_threshold: float = 0.6):
+        self.min_overlap_ratio = min_overlap_ratio
+        self.boundary_tolerance = boundary_tolerance
+        self.min_segment_duration = min_segment_duration
+        self.use_vad_boundaries = use_vad_boundaries
+        self.use_timeline = use_timeline
+        self.neighbor_window = neighbor_window
+        self.confidence_threshold = confidence_threshold
+        self.assignment_stats = defaultdict(int)
+
+    def map_speakers(self,
+                     segments: List[Dict[str, Any]],
+                     words: List[Dict[str, Any]],
+                     diarization: List[Dict[str, Any]],
+                     timeline: Optional[List[Dict[str, Any]]] = None,
+                     vad_regions: Optional[List[Dict[str, float]]] = None) -> Tuple[List[Dict], List[Dict]]:
+
+        segments = copy.deepcopy(segments)
+        words = copy.deepcopy(words)
+
+        diar_segments = self._normalize_diarization(diarization)
+        timeline_segs = self._normalize_timeline(timeline) if timeline else None
+        vad_regions = self._normalize_vad(vad_regions) if vad_regions else None
+
+        if self.use_vad_boundaries and vad_regions:
+            segments = self._adjust_boundaries_with_vad(segments, vad_regions)
+
+        for idx, seg in enumerate(segments):
+            candidates = self._get_speaker_candidates(
+                seg, idx, segments, diar_segments, timeline_segs
             )
-            current_segment["word_count"] = len(current_segment["words"])
-            del current_segment["words"]  # words alanını kaldır
-            del current_segment["speaker"]  # speaker alanını kaldır (zaten üst seviyede var)
-            segments.append(current_segment)
 
-        # Konuşmacıya ait segmentleri kaydet
-        segments_by_speaker[speaker] = {
-            "segments": segments
-        }
+            if candidates:
+                best_candidate = self._select_best_candidate(candidates, seg, segments, idx)
+                if best_candidate and best_candidate.metrics.confidence >= self.confidence_threshold:
+                    seg["speaker"] = best_candidate.speaker_id
+                    seg["confidence"] = best_candidate.metrics.confidence
+                    seg["assignment_source"] = best_candidate.source
+                    self.assignment_stats[best_candidate.source] += 1
+                else:
+                    if candidates:
+                        seg["speaker"] = candidates[0].speaker_id
+                        seg["confidence"] = candidates[0].metrics.confidence
+                        seg["assignment_source"] = "low_confidence"
+                        self.assignment_stats["low_confidence"] += 1
 
-    # Dosyayı kaydet
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(segments_by_speaker, f, ensure_ascii=False, indent=2)
+        segments = self._merge_short_segments(segments)
+        segments = self._fix_isolated_segments(segments)
+        words = self._assign_words_optimized(words, segments, diar_segments)
+        segments, words = self._final_consistency_pass(segments, words)
 
-    logger.info(f"✓ Konuşmacı bazlı çıktı oluşturuldu: {output_path}")
+        return segments, words
 
-    # İstatistikleri logla
-    logger.info("Konuşmacı segment dağılımı:")
-    for speaker in speakers:
-        seg_count = len(segments_by_speaker[speaker]["segments"])
-        if seg_count > 0:
-            total_duration = sum(s["duration"] for s in segments_by_speaker[speaker]["segments"])
-            total_words = sum(s["word_count"] for s in segments_by_speaker[speaker]["segments"])
-            logger.info(f"  {speaker}: {seg_count} segment, {total_duration:.1f}s, {total_words} kelime")
+    def _normalize_diarization(self, diar: List[Dict]) -> List[Dict]:
+        normalized = []
+        for d in diar:
+            normalized.append({
+                "start": float(d["start"]),
+                "end": float(d["end"]),
+                "speaker": str(d["speaker"]),
+                "duration": float(d["end"]) - float(d["start"])
+            })
+        return sorted(normalized, key=lambda x: (x["start"], x["end"]))
 
-    return output_path
+    def _normalize_timeline(self, timeline: Optional[List[Dict]]) -> Optional[List[Dict]]:
+        if not timeline:
+            return None
+        normalized = []
+        for t in timeline:
+            normalized.append({
+                "start": float(t["start"]),
+                "end": float(t["end"]),
+                "mode": t["mode"],
+                "speakers": t["speakers"],
+                "channels": t.get("channels", {}),
+                "duration": float(t["end"]) - float(t["start"])
+            })
+        return sorted(normalized, key=lambda x: x["start"])
 
+    def _normalize_vad(self, vad_regions: List[Dict[str, float]]) -> List[Dict[str, float]]:
+        normalized = []
+        for v in vad_regions:
+            normalized.append({
+                "start": float(v["start"]),
+                "end": float(v["end"]),
+                "duration": float(v["end"]) - float(v["start"])
+            })
+        return sorted(normalized, key=lambda x: x["start"])
 
-def process_dialog(input_json, out_json_path):
-    http_client = httpx.Client(transport=transport)
+    def _calculate_segment_metrics(self, seg1_start: float, seg1_end: float,
+                                   seg2_start: float, seg2_end: float) -> SegmentMetrics:
+        overlap_start = max(seg1_start, seg2_start)
+        overlap_end = min(seg1_end, seg2_end)
+        overlap_duration = max(0, overlap_end - overlap_start)
 
-    client = anthropic.Anthropic(
-            api_key=os.getenv("ANTHROPIC_API_KEY"),
-            http_client=http_client
+        seg1_duration = seg1_end - seg1_start
+        seg2_duration = seg2_end - seg2_start
+
+        overlap_ratio_stt = overlap_duration / max(seg1_duration, 0.001)
+        overlap_ratio_diar = overlap_duration / max(seg2_duration, 0.001)
+
+        union = seg1_duration + seg2_duration - overlap_duration
+        iou = overlap_duration / max(union, 0.001)
+
+        start_distance = abs(seg1_start - seg2_start)
+        end_distance = abs(seg1_end - seg2_end)
+        boundary_distance = (start_distance + end_distance) / 2
+
+        confidence = self._calculate_confidence(
+            overlap_ratio_stt, overlap_ratio_diar, iou, boundary_distance
         )
-        # Diarization ve input parametrelerini ekledik
-    message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=128000,
-        temperature=1,
-        system="Verilen ardışık cümleleri mantıksal sıraya göre düzenle ve mantıklı dialog olacak sekilde aşağıdaki kriterlere uygun bir JSON çıktısı oluştur:\n\nGereksinimler:\n1. Cümleleri mantıksal ve dilbilgisi açısından doğru bir sıraya koy\n2. Her bir cümlenin yanına ISO 8601 formatında bir zaman damgası ekle\n3. JSON formatında çıktı ver\n4. Her cümlenin benzersiz bir ID'si olmalı\n5. Cümlelerin sıralamasını ve mantıksal akışını kontrol et\n6. en öneli adim {{SEGMENT_INPUT_JSON}} uygun olmali\nJSON Şablonu:\n{\n \"sentences\": [\n {\n \"id\": \"unique_id_1\",\n \"text\": \"Düzenlenmiş cümle\",\n \"start\": 0.0,\n \"end\": 3.64,\n \"duration\": 13.7,\n \"word_count\": 52,\n \"speaker\": \"SPEAKER_00\",\n },\n ...\n ]\n}",
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "\n\n\nBeklenen Çıktı: Mantıksal sıralanmış, zaman damgalı JSON\n\n\nGirdi: \n{{INPUT_JSON}}\n{{SEGMENT_INPUT_JSON}}"
-                    }
-                ]
-            }
-        ],
-        thinking={
-            "type": "enabled",
-            "budget_tokens": 51200
-        }
-    )
 
-    # Çıktıyı JSON dosyasına kaydet
-    try:
-        processed_dialog = json.loads(message.content[0].text)
+        return SegmentMetrics(
+            overlap_duration=overlap_duration,
+            overlap_ratio_stt=overlap_ratio_stt,
+            overlap_ratio_diar=overlap_ratio_diar,
+            iou=iou,
+            boundary_distance=boundary_distance,
+            confidence=confidence
+        )
 
-        # Diarization bilgilerini ekle
-        diarization_info = {
-            "speakers": ["SPEAKER_00", "SPEAKER_01"],
-            "total_speakers": 2,
-            "language": "tr",
-            "processing_time": 0.5  # saniye cinsinden
+    def _calculate_confidence(self, overlap_stt: float, overlap_diar: float,
+                              iou: float, boundary_dist: float) -> float:
+        boundary_score = max(0, 1 - (boundary_dist / 2.0))
+
+        weights = {
+            'overlap_stt': 0.35,
+            'overlap_diar': 0.25,
+            'iou': 0.25,
+            'boundary': 0.15
         }
 
-        processed_dialog["diarization"] = diarization_info
+        confidence = (
+                weights['overlap_stt'] * overlap_stt +
+                weights['overlap_diar'] * overlap_diar +
+                weights['iou'] * iou +
+                weights['boundary'] * boundary_score
+        )
 
-        # Çıktıyı dosyaya yaz
-        with open(out_json_path, 'w', encoding='utf-8') as f:
-            json.dump(processed_dialog, f, ensure_ascii=False, indent=2)
+        return min(1.0, max(0.0, confidence))
 
-        print(f"İşlenen dialog {out_json_path} dosyasına kaydedildi.")
-        return processed_dialog
+    def _adjust_boundaries_with_vad(self, segments: List[Dict],
+                                    vad_regions: List[Dict]) -> List[Dict]:
+        adjusted = []
 
-    except json.JSONDecodeError as e:
-        print(f"JSON Decode Hatası: {e}")
+        for seg in segments:
+            seg_start = float(seg.get("start", 0))
+            seg_end = float(seg.get("end", 0))
+
+            best_vad = None
+            best_overlap = 0
+
+            for vad in vad_regions:
+                overlap = min(seg_end, vad["end"]) - max(seg_start, vad["start"])
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_vad = vad
+
+            if best_vad:
+                tolerance = self.boundary_tolerance
+
+                if abs(seg_start - best_vad["start"]) < tolerance:
+                    seg["start"] = best_vad["start"]
+                if abs(seg_end - best_vad["end"]) < tolerance:
+                    seg["end"] = best_vad["end"]
+
+            adjusted.append(seg)
+
+        return adjusted
+
+    def _get_speaker_candidates(self, segment: Dict, seg_idx: int,
+                                all_segments: List[Dict],
+                                diar_segments: List[Dict],
+                                timeline_segs: Optional[List[Dict]]) -> List[SpeakerCandidate]:
+        candidates = []
+        seg_start = float(segment.get("start", 0))
+        seg_end = float(segment.get("end", 0))
+
+        if seg_end <= seg_start:
+            return candidates
+
+        speaker_scores = defaultdict(lambda: {'metrics': None, 'weight': 0})
+
+        for diar_seg in diar_segments:
+            metrics = self._calculate_segment_metrics(
+                seg_start, seg_end,
+                diar_seg["start"], diar_seg["end"]
+            )
+
+            if metrics.overlap_ratio_stt >= self.min_overlap_ratio:
+                speaker = diar_seg["speaker"]
+
+                if speaker_scores[speaker]['metrics'] is None or \
+                        metrics.confidence > speaker_scores[speaker]['metrics'].confidence:
+                    speaker_scores[speaker]['metrics'] = metrics
+                    speaker_scores[speaker]['weight'] = 1.0
+
+        for speaker, data in speaker_scores.items():
+            if data['metrics']:
+                candidates.append(SpeakerCandidate(
+                    speaker_id=speaker,
+                    metrics=data['metrics'],
+                    source="diarization",
+                    weight=data['weight']
+                ))
+
+        if self.use_timeline and timeline_segs:
+            timeline_candidate = self._get_timeline_candidate(segment, timeline_segs)
+            if timeline_candidate:
+                candidates.append(timeline_candidate)
+
+        neighbor_candidates = self._get_neighbor_candidates(
+            segment, seg_idx, all_segments, diar_segments
+        )
+        candidates.extend(neighbor_candidates)
+
+        candidates.sort(key=lambda c: c.metrics.confidence * c.weight, reverse=True)
+
+        return candidates
+
+    def _get_timeline_candidate(self, segment: Dict,
+                                timeline_segs: List[Dict]) -> Optional[SpeakerCandidate]:
+        seg_start = float(segment.get("start", 0))
+        seg_end = float(segment.get("end", 0))
+        seg_mid = (seg_start + seg_end) / 2
+
+        for tl_seg in timeline_segs:
+            if tl_seg["start"] <= seg_mid <= tl_seg["end"]:
+                if tl_seg["mode"] == "mono":
+                    metrics = self._calculate_segment_metrics(
+                        seg_start, seg_end,
+                        tl_seg["start"], tl_seg["end"]
+                    )
+                    metrics.confidence = min(1.0, metrics.confidence * 1.2)
+
+                    return SpeakerCandidate(
+                        speaker_id=tl_seg["speakers"][0],
+                        metrics=metrics,
+                        source="timeline",
+                        weight=1.2
+                    )
+
         return None
-    except Exception as e:
-        print(f"Bir hata oluştu: {e}")
-        return None
 
+    def _get_neighbor_candidates(self, segment: Dict, seg_idx: int,
+                                 all_segments: List[Dict],
+                                 diar_segments: List[Dict]) -> List[SpeakerCandidate]:
+        candidates = []
 
-# ========================= ANA PROGRAM =========================
+        for offset in range(1, self.neighbor_window + 1):
+            for idx in [seg_idx - offset, seg_idx + offset]:
+                if 0 <= idx < len(all_segments) and idx != seg_idx:
+                    neighbor = all_segments[idx]
 
-def main():
+                    if "speaker" in neighbor and neighbor.get("confidence", 0) > 0.7:
+                        distance_weight = 1.0 / (abs(idx - seg_idx) + 1)
 
-    """
-    Ana program akışı:
-    1. Parametreleri al
-    2. Ses dosyasını hazırla
-    3. Modelleri yükle
-    4. Analizleri yap (VAD, OSD, Diarization)
-    5. Transkripsiyon yap
-    6. Konuşmacıları ata
-    7. Segmentleri oluştur
-    8. Sonuçları kaydet
-    """
-    parser = argparse.ArgumentParser(
-        description="🎙️ Ses Dosyası Diarizasyon ve Transkripsiyon Sistemi",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Örnek kullanım:
-  python diarize.py --input meeting.mp4 --output result.json --hf-token YOUR_TOKEN
-  
-Debug modu:
-  python diarize.py --input audio.wav --output out.json --hf-token TOKEN --debug DEBUG --log-file debug.log
-        """
-    )
+                        metrics = SegmentMetrics(
+                            overlap_duration=0,
+                            overlap_ratio_stt=0,
+                            overlap_ratio_diar=0,
+                            iou=0,
+                            boundary_distance=abs(idx - seg_idx),
+                            confidence=neighbor.get("confidence", 0.5) * distance_weight * 0.6
+                        )
 
-    # Temel parametreler
-    parser.add_argument("--input", required=True,
-                        help="Girdi ses dosyası (MP4/MP3/WAV)")
-    parser.add_argument("--output", required=True,
-                        help="Çıktı JSON dosyası")
-    parser.add_argument("--hf-token",
-                        default=os.environ.get("HF_TOKEN"),
-                        help="HuggingFace API token (veya $HF_TOKEN)")
+                        candidates.append(SpeakerCandidate(
+                            speaker_id=neighbor["speaker"],
+                            metrics=metrics,
+                            source="neighbor",
+                            weight=distance_weight * 0.5
+                        ))
 
-    # Debug parametreleri
-    parser.add_argument("--debug", default="INFO",
-                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-                        help="Debug seviyesi")
-    parser.add_argument("--log-file", default=None,
-                        help="Log dosyası (opsiyonel)")
-    parser.add_argument("--dump-debug", default=None,
-                        help="Ara sonuçları kaydet (klasör yolu)")
+        return candidates
 
-    # ASR parametreleri
-    parser.add_argument("--asr-model", default="large-v3",
-                        choices=["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"],
-                        help="Whisper model boyutu")
-    parser.add_argument("--asr-device", default="auto",
-                        help="İşlemci (cpu/cuda/auto)")
-    parser.add_argument("--asr-compute-type", default="auto",
-                        help="Hesaplama tipi (int8/float16/auto)")
-    parser.add_argument("--language", default=None,
-                        help="Transkripsiyon dili (tr, en, vb.)")
+    def _select_best_candidate(self, candidates: List[SpeakerCandidate],
+                               segment: Dict, all_segments: List[Dict],
+                               seg_idx: int) -> Optional[SpeakerCandidate]:
+        if not candidates:
+            return None
 
-    # Diarization parametreleri
-    parser.add_argument("--min-speakers", type=int, default=None,
-                        help="Minimum konuşmacı sayısı")
-    parser.add_argument("--max-speakers", type=int, default=None,
-                        help="Maksimum konuşmacı sayısı")
+        best = candidates[0]
 
-    # Filtreleme parametreleri
-    parser.add_argument("--require-vad", action="store_true",
-                        help="Sadece VAD tespit edilen bölgeleri kullan")
-    parser.add_argument("--vad-coverage", type=float, default=0.6,
-                        help="Minimum VAD kapsama oranı (0-1)")
+        high_confidence_candidates = [c for c in candidates
+                                      if c.metrics.confidence > self.confidence_threshold]
 
-    args = parser.parse_args()
+        if len(high_confidence_candidates) > 1:
+            source_priority = {"timeline": 3, "diarization": 2, "neighbor": 1}
 
-    # Logger kurulumu
-    global logger
-    logger = setup_logger(args.debug, args.log_file)
+            high_confidence_candidates.sort(
+                key=lambda c: (
+                    c.metrics.confidence * c.weight,
+                    source_priority.get(c.source, 0)
+                ),
+                reverse=True
+            )
 
-    # Başlangıç
-    logger.info("="*60)
-    logger.info("🎙️  SES DOSYASI DİARİZASYON VE TRANSKRİPSİYON")
-    logger.info("="*60)
-    logger.info(f"Girdi: {args.input}")
-    logger.info(f"Çıktı: {args.output}")
-    logger.info(f"Debug seviyesi: {args.debug}")
+            best = high_confidence_candidates[0]
 
-    # Token kontrolü
-    if not args.hf_token:
-        logger.error("HuggingFace token gerekli! --hf-token veya $HF_TOKEN")
-        sys.exit(1)
+        return best
 
-    try:
-        # ============ AŞAMA 1: SES HAZIRLAMA ============
-        logger.info("\n" + "="*40)
-        logger.info("AŞAMA 1: SES DOSYASI HAZIRLAMA")
-        logger.info("="*40)
+    def _merge_short_segments(self, segments: List[Dict]) -> List[Dict]:
+        merged = []
+        i = 0
 
-        wav_path = ffmpeg_to_wav_mono16k(args.input)
+        while i < len(segments):
+            current = segments[i]
+            duration = float(current.get("end", 0)) - float(current.get("start", 0))
 
-        # ============ AŞAMA 2: MODEL YÜKLEME ============
-        logger.info("\n" + "="*40)
-        logger.info("AŞAMA 2: MODELLERİ YÜKLEME")
-        logger.info("="*40)
+            if duration < self.min_segment_duration and i < len(segments) - 1:
+                next_seg = segments[i + 1]
+                gap = float(next_seg.get("start", 0)) - float(current.get("end", 0))
 
-        vad = build_vad(args.hf_token)
-        osd = build_osd(args.hf_token)
-        diar = build_diarization(args.hf_token,
-                                 args.min_speakers,
-                                 args.max_speakers)
-
-        logger.info(f"\nWhisper modeli yükleniyor: {args.asr_model}")
-        asr = WhisperModel(args.asr_model,
-                           device=args.asr_device,
-                           compute_type=args.asr_compute_type)
-        logger.info("✓ Tüm modeller hazır")
-
-        # ============ AŞAMA 3: SES ANALİZİ ============
-        logger.info("\n" + "="*40)
-        logger.info("AŞAMA 3: SES ANALİZİ")
-        logger.info("="*40)
-
-        # 3.1 Voice Activity Detection
-        logger.info("\n--- VAD (Konuşma Tespiti) ---")
-        vad_ann = vad(wav_path)
-        vad_timeline = vad_ann.get_timeline().support()
-        log_timeline(vad_timeline, "VAD Sonucu")
-
-        # 3.2 Overlapped Speech Detection
-        logger.info("\n--- OSD (Çakışma Tespiti) ---")
-        osd_ann = osd(wav_path)
-        osd_timeline = osd_ann.get_timeline().support()
-        log_timeline(osd_timeline, "OSD Sonucu")
-
-        # 3.3 Speaker Diarization
-        logger.info("\n--- Diarization (Konuşmacı Ayrımı) ---")
-        diar_ann = diar(wav_path)
-
-        # Konuşmacı sayısı
-        speakers = list(diar_ann.labels())
-        logger.info(f"Tespit edilen konuşmacı sayısı: {len(speakers)}")
-        logger.info(f"Konuşmacılar: {', '.join(speakers)}")
-
-        # 3.4 Çakışma bölgelerini belirle
-        logger.info("\n--- Çakışma Analizi ---")
-        diar_overlap = build_overlap_from_diarization(diar_ann, min_count=2)
-        osd_in_vad = intersect_timelines(osd_timeline, vad_timeline)
-        final_overlap = intersect_timelines(osd_in_vad, diar_overlap)
-        final_overlap = filter_tiny_overlaps(final_overlap, min_duration=0.5)
-        log_timeline(final_overlap, "Final Çakışma Bölgeleri")
-
-        # ============ AŞAMA 4: TRANSKRİPSİYON ============
-        logger.info("\n" + "="*40)
-        logger.info("AŞAMA 4: TRANSKRİPSİYON")
-        logger.info("="*40)
-
-        words = transcribe_words(asr, wav_path, args.language)
-
-        # ============ AŞAMA 5: KONUŞMACI ATAMA ============
-        logger.info("\n" + "="*40)
-        logger.info("AŞAMA 5: KONUŞMACI ATAMA")
-        logger.info("="*40)
-
-        prev_speaker = None
-        tagged_words = []
-        vad_filtered = 0
-        overlap_words = 0
-
-        for i, word in enumerate(words):
-            seg = Segment(word["start"], word["end"])
-
-            # VAD filtresi
-            if args.require_vad:
-                coverage = timeline_coverage_ratio(vad_timeline, seg)
-                if coverage < args.vad_coverage:
-                    vad_filtered += 1
-                    logger.debug(f"Kelime {i} VAD filtresine takıldı: "
-                                 f"'{word['word']}' (kapsama: {coverage:.2%})")
+                if (current.get("speaker") == next_seg.get("speaker") and
+                        gap < 0.3):
+                    current["end"] = next_seg.get("end", current["end"])
+                    if "text" in current and "text" in next_seg:
+                        current["text"] = current["text"] + " " + next_seg["text"]
+                    if "confidence" in current and "confidence" in next_seg:
+                        current["confidence"] = max(current["confidence"],
+                                                    next_seg["confidence"])
+                    merged.append(current)
+                    i += 2
                     continue
 
-            # Çakışma kontrolü
-            is_overlap = timeline_overlaps(final_overlap, seg)
-            if is_overlap:
-                overlap_words += 1
+            merged.append(current)
+            i += 1
 
-            # Konuşmacı ata
-            speaker, confidence = assign_speaker_midwin(
-                diar_ann, seg, prev_speaker, is_overlap
-            )
+        return merged
 
-            prev_speaker = speaker
+    def _fix_isolated_segments(self, segments: List[Dict]) -> List[Dict]:
+        if len(segments) < 3:
+            return segments
 
-            tagged_words.append({
-                "word": word["word"],
-                "start": word["start"],
-                "end": word["end"],
-                "speaker": speaker,
-                "confidence": word["confidence"],
-                "speaker_confidence": confidence,
-                "is_overlap": is_overlap
-            })
+        fixed = segments.copy()
 
-            # İlerleme göstergesi
-            if (i + 1) % 100 == 0:
-                logger.info(f"  İşlenen kelime: {i+1}/{len(words)}")
+        for i in range(1, len(segments) - 1):
+            prev_speaker = segments[i-1].get("speaker")
+            curr_speaker = segments[i].get("speaker")
+            next_speaker = segments[i+1].get("speaker")
 
-        logger.info(f"✓ Konuşmacı ataması tamamlandı:")
-        logger.info(f"  Toplam kelime: {len(words)}")
-        logger.info(f"  İşlenen: {len(tagged_words)}")
-        if vad_filtered > 0:
-            logger.info(f"  VAD filtresi: {vad_filtered} kelime")
-        if overlap_words > 0:
-            logger.info(f"  Çakışmada: {overlap_words} kelime")
+            if (prev_speaker and next_speaker and
+                    prev_speaker == next_speaker and
+                    curr_speaker != prev_speaker):
 
-        # ============ AŞAMA 6: SEGMENT OLUŞTURMA ============
-        logger.info("\n" + "="*40)
-        logger.info("AŞAMA 6: SEGMENT OLUŞTURMA")
-        logger.info("="*40)
+                duration = float(segments[i].get("end", 0)) - float(segments[i].get("start", 0))
+                curr_confidence = segments[i].get("confidence", 0.5)
 
-        segments = merge_words_into_segments(tagged_words,
-                                             max_gap=1.5,
-                                             max_len=30.0)
+                if duration < 0.5 and curr_confidence < 0.7:
+                    fixed[i]["speaker"] = prev_speaker
+                    fixed[i]["confidence"] = min(
+                        segments[i-1].get("confidence", 0.5),
+                        segments[i+1].get("confidence", 0.5)
+                    ) * 0.8
+                    fixed[i]["assignment_source"] = "isolation_fix"
+                    self.assignment_stats["isolation_fix"] += 1
 
-        # Küçük segmentleri birleştir
-        segments = post_merge_tiny_segments(segments,
-                                            min_duration=2.0,
-                                            max_gap=1.5)
+        return fixed
 
-        # ============ AŞAMA 7: ÇIKTI KAYDETME ============
-        logger.info("\n" + "="*40)
-        logger.info("AŞAMA 7: SONUÇLARI KAYDETME")
-        logger.info("="*40)
+    def _assign_words_optimized(self, words: List[Dict], segments: List[Dict],
+                                diar_segments: List[Dict]) -> List[Dict]:
+        seg_speaker_map = {}
+        for seg in segments:
+            seg_id = seg.get("id")
+            if seg_id is not None and "speaker" in seg:
+                seg_speaker_map[seg_id] = seg["speaker"]
 
-        # Ana çıktı
-        output = {
-            "metadata": {
-                "input_file": args.input,
-                "total_segments": len(segments),
-                "speakers": speakers,
-                "language": args.language or "auto",
-                "model": args.asr_model,
-                "processing_date": datetime.now().isoformat()
-            },
-            "segments": segments
+        for word in words:
+            seg_id = word.get("segment_id")
+            if seg_id in seg_speaker_map:
+                word["speaker"] = seg_speaker_map[seg_id]
+                continue
+
+            if "start" in word and word["start"] is not None:
+                word_time = float(word["start"])
+
+                for seg in segments:
+                    if float(seg.get("start", 0)) <= word_time <= float(seg.get("end", 0)):
+                        if "speaker" in seg:
+                            word["speaker"] = seg["speaker"]
+                            break
+
+                if "speaker" not in word:
+                    for diar_seg in diar_segments:
+                        if diar_seg["start"] <= word_time <= diar_seg["end"]:
+                            word["speaker"] = diar_seg["speaker"]
+                            break
+
+        return words
+
+    def _final_consistency_pass(self, segments: List[Dict],
+                                words: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        for seg in segments:
+            seg_id = seg.get("id")
+            if seg_id is None:
+                continue
+
+            seg_words = [w for w in words if w.get("segment_id") == seg_id]
+
+            if not seg_words:
+                continue
+
+            word_speakers = [w.get("speaker") for w in seg_words if "speaker" in w]
+
+            if word_speakers:
+                speaker_counts = Counter(word_speakers)
+                most_common_speaker, count = speaker_counts.most_common(1)[0]
+
+                if count / len(word_speakers) > 0.7:
+                    if seg.get("speaker") != most_common_speaker:
+                        seg["speaker"] = most_common_speaker
+                        seg["assignment_source"] = "word_majority"
+                        self.assignment_stats["word_majority"] += 1
+
+                    for w in seg_words:
+                        w["speaker"] = most_common_speaker
+
+        return segments, words
+
+    def get_statistics(self) -> Dict[str, Any]:
+        return {
+            "assignment_sources": dict(self.assignment_stats),
+            "total_assignments": sum(self.assignment_stats.values())
         }
 
-        input_json = diar_ann
-        out_json_path = output
+# ------------------ Pipeline Utilities ------------------
 
-        result = process_dialog(input_json, out_json_path)
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
+MAX_BODY_BYTES = 26_214_400
+SOFT_LIMIT_BYTES = 24 * 1024 * 1024
 
-        logger.info(f"✓ Ana çıktı kaydedildi: {args.output}")
+class DebugWriter:
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.events: List[Dict[str, Any]] = []
+    def snap(self, tag: str, **data: Any):
+        if not self.enabled:
+            return
+        evt = {"tag": tag, "ts": time.time(), **data}
+        self.events.append(evt)
+        kv = " ".join(f"{k}={v}" for k, v in data.items())
+        print(f"[{tag}] {kv}")
 
-        # Debug dosyaları
-        if args.dump_debug:
-            logger.info(f"\nDebug dosyaları kaydediliyor: {args.dump_debug}")
-            os.makedirs(args.dump_debug, exist_ok=True)
+def _require_ffmpeg():
+    for bin_name in ("ffmpeg", "ffprobe"):
+        if shutil.which(bin_name) is None:
+            raise RuntimeError(f"{bin_name} bulunamadı. FFmpeg/FFprobe kurulu olmalı.")
 
-            debug_files = {
-                "vad.json": {
-                    "description": "Voice Activity Detection sonuçları",
-                    "segments": timeline_to_dict(vad_timeline)
-                },
-                "osd.json": {
-                    "description": "Overlapped Speech Detection sonuçları",
-                    "segments": timeline_to_dict(osd_timeline)
-                },
-                "diarization.json": {
-                    "description": "Speaker Diarization sonuçları",
-                    "speakers": speakers,
-                    "segments": diarization_to_dict(diar_ann)
-                },
-                "overlap.json": {
-                    "description": "Final çakışma bölgeleri",
-                    "segments": timeline_to_dict(final_overlap)
-                },
-                "words.json": {
-                    "description": "Transkribe edilmiş kelimeler",
-                    "total": len(words),
-                    "words": words[:100]  # İlk 100 kelime
-                },
-                "tagged_words.json": {
-                    "description": "Konuşmacı atamalı kelimeler",
-                    "total": len(tagged_words),
-                    "words": tagged_words[:100]  # İlk 100 kelime
-                }
-            }
+def _run(cmd: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+def probe_duration_seconds(path: Path) -> float:
+    _require_ffmpeg()
+    cp = _run([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=nokey=1:noprint_wrappers=1",
+        str(path)
+    ])
+    try:
+        return float(cp.stdout.decode().strip())
+    except Exception:
+        return 0.0
 
+def transcode_audio_under_limit(
+        src_video: Path,
+        workdir: Path,
+        try_bitrates_kbps: Tuple[int, ...] = (64, 48, 32, 24, 16),
+        ar: int = 16000,
+        ac: int = 1,
+        dbg: Optional[DebugWriter] = None,
+) -> Path:
+    _require_ffmpeg()
+    workdir.mkdir(parents=True, exist_ok=True)
+    dur = probe_duration_seconds(src_video)
+    if dbg: dbg.snap("AUDIO_PROBE", duration_sec=round(dur, 2))
+    for br in try_bitrates_kbps:
+        out = workdir / f"{src_video.stem}.mono{ac}_{ar//1000}kHz_{br}kbps.m4a"
+        cmd = ["ffmpeg","-y","-i",str(src_video),"-vn","-ac",str(ac),"-ar",str(ar),"-c:a","aac","-b:a",f"{br}k","-movflags","+faststart",str(out)]
+        _run(cmd)
+        size = out.stat().st_size
+        if dbg: dbg.snap("AUDIO_ENCODED", bitrate_kbps=br, size_bytes=size)
+        if size <= SOFT_LIMIT_BYTES:
+            return out
+    return out
 
-            for filename, data in debug_files.items():
-                filepath = os.path.join(args.dump_debug, filename)
-                with open(filepath, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                logger.info(f"  ✓ {filename}")
+def split_audio_by_duration(
+        audio_path: Path,
+        chunk_sec: int,
+        outdir: Path,
+        copy_codecs: bool = True,
+        dbg: Optional[DebugWriter] = None,
+) -> List[Tuple[Path, float]]:
+    _require_ffmpeg()
+    outdir.mkdir(parents=True, exist_ok=True)
+    duration = probe_duration_seconds(audio_path)
+    if duration == 0:
+        raise RuntimeError("Süre okunamadı; ffprobe başarısız.")
+    chunks: List[Tuple[Path, float]] = []
+    n = math.ceil(duration / chunk_sec)
+    for i in range(n):
+        start = i * chunk_sec
+        length = min(chunk_sec, duration - start)
+        out = outdir / f"chunk_{i:04d}.m4a"
+        cmd = ["ffmpeg","-y","-ss",f"{start:.3f}","-i",str(audio_path),"-t",f"{length:.3f}"]
+        if copy_codecs:
+            cmd += ["-c","copy","-movflags","+faststart"]
+        else:
+            cmd += ["-ac","1","-ar","16000","-c:a","aac","-b:a","48k","-movflags","+faststart"]
+        cmd += [str(out)]
+        _run(cmd)
+        chunks.append((out, start))
+    if dbg: dbg.snap("AUDIO_SPLIT", n_chunks=len(chunks), approx_chunk_sec=chunk_sec)
+    return chunks
 
+def ensure_wav_mono16k(audio_in: Path, outdir: Path) -> Path:
+    outdir.mkdir(parents=True, exist_ok=True)
+    wav = outdir / f"{audio_in.stem}.mono16k.wav"
+    _run(["ffmpeg","-y","-i",str(audio_in),"-ac","1","-ar","16000","-c:a","pcm_s16le",str(wav)])
+    return wav
 
+def _sdk_transcribe_verbose(client: OpenAI, path: Path, model: str, language: Optional[str], prompt: Optional[str], want_word_timestamps: bool) -> dict:
+    extra = {}
+    if model == "whisper-1" and want_word_timestamps:
+        extra["timestamp_granularities"] = ["word","segment"]
+    with path.open("rb") as f:
+        tr = client.audio.transcriptions.create(
+            model=model, file=f, response_format="verbose_json", language=language, prompt=prompt, **extra
+        )
+    for attr in ("model_dump","to_dict"):
+        if hasattr(tr, attr):
+            return getattr(tr, attr)()
+    js = getattr(tr,"model_dump_json",None)
+    return json.loads(js()) if callable(js) else json.loads(str(tr))
 
+def _requests_transcribe_verbose(path: Path, model: str, language: Optional[str], prompt: Optional[str], want_word_timestamps: bool) -> dict:
+    headers = {"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"}
+    data = [("model",model),("response_format","verbose_json")]
+    if language: data.append(("language",language))
+    if prompt:   data.append(("prompt",prompt))
+    if want_word_timestamps and model == "whisper-1":
+        data.append(("timestamp_granularities[]","word"))
+        data.append(("timestamp_granularities[]","segment"))
+    with path.open("rb") as f:
+        files = {"file": (path.name, f, "application/octet-stream")}
+        r = requests.post("https://api.openai.com/v1/audio/transcriptions", headers=headers, data=data, files=files, timeout=(15,600))
+    r.raise_for_status()
+    return r.json()
 
+def transcribe_file(path: Path, model: str="whisper-1", language: Optional[str]=None, prompt: Optional[str]=None, want_word_timestamps: bool=True, dbg: Optional[DebugWriter]=None) -> dict:
+    client = OpenAI()
+    try:
+        if dbg: dbg.snap("TRANSCRIBE_SDK", file=str(path))
+        return _sdk_transcribe_verbose(client, path, model, language, prompt, want_word_timestamps)
+    except BadRequestError as e:
+        msg = str(e).lower()
+        if "something went wrong" in msg or "invalid_request_error" in msg:
+            if dbg: dbg.snap("TRANSCRIBE_FALLBACK", reason="badrequest")
+            return _requests_transcribe_verbose(path, model, language, prompt, want_word_timestamps)
+        raise
 
-        # Temizlik
-        try:
-            os.remove(wav_path)
-            logger.info(f"\nGeçici dosya silindi: {wav_path}")
-        except Exception as e:
-            logger.warning(f"Geçici dosya silinemedi: {e}")
+def _vad_pyannote(wav_path: Path, dbg: DebugWriter) -> List[Dict[str, float]]:
+    from pyannote.audio import Pipeline
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+    if not token:
+        raise RuntimeError("HF_TOKEN tanımlı değil.")
+    pipe = Pipeline.from_pretrained("pyannote/voice-activity-detection", use_auth_token=token)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            pipe.to(torch.device("cuda"))
+            dbg.snap("VAD_INIT", device="cuda")
+        else:
+            dbg.snap("VAD_INIT", device="cpu")
+    except Exception:
+        dbg.snap("VAD_INIT", device="cpu-no-torch")
 
-        # ============ ÖZET ============
-        logger.info("\n" + "="*60)
-        logger.info("✨ İŞLEM BAŞARIYLA TAMAMLANDI!")
-        logger.info("="*60)
-        logger.info(f"Çıktı dosyası: {args.output}")
-        logger.info(f"Toplam segment: {len(segments)}")
-        logger.info(f"Konuşmacı sayısı: {len(speakers)}")
+    t0 = time.perf_counter()
+    vad_annot = pipe(str(wav_path))
+    t1 = time.perf_counter()
+    speech_tl = vad_annot.get_timeline().support()
+    regions: List[Dict[str, float]] = []
+    for seg in speech_tl:
+        regions.append({"start": float(seg.start), "end": float(seg.end)})
+    total = sum(r["end"] - r["start"] for r in regions)
+    dbg.snap("VAD_DONE", regions=len(regions), total_speech_sec=round(total,2), secs=round(t1-t0,3))
+    return regions
 
-        # Segment uzunluk istatistikleri
+def _diarize_pyannote(wav_path: Path, speaker_count: Optional[int], dbg: DebugWriter) -> List[Dict[str, Any]]:
+    from pyannote.audio import Pipeline
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+    if not token:
+        raise RuntimeError("HF_TOKEN tanımlı değil.")
+    pipe = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            pipe.to(torch.device("cuda"))
+            dbg.snap("DIAR_INIT", device="cuda")
+        else:
+            dbg.snap("DIAR_INIT", device="cpu")
+    except Exception:
+        dbg.snap("DIAR_INIT", device="cpu-no-torch")
+
+    t0 = time.perf_counter()
+    diar = pipe(str(wav_path)) if speaker_count is None else pipe(str(wav_path), num_speakers=max(1,int(speaker_count)))
+    t1 = time.perf_counter()
+
+    diar_segments: List[Dict[str, Any]] = []
+    for turn, _, spk in diar.itertracks(yield_label=True):
+        diar_segments.append({"start": float(turn.start), "end": float(turn.end), "speaker": str(spk)})
+    diar_segments.sort(key=lambda d: d["start"])
+    total_talk = sum(ds["end"] - ds["start"] for ds in diar_segments)
+    dbg.snap("DIAR_DONE", diar_segments=len(diar_segments), est_speakers=len({d['speaker'] for d in diar_segments}),
+             total_speaking_time_sec=round(total_talk,2), secs=round(t1-t0,3))
+    return diar_segments
+
+def _overlap(a0, a1, b0, b1) -> float:
+    return max(0.0, min(a1,b1) - max(a0,b0))
+
+def clip_segments_to_regions(segments: List[Dict[str, Any]], regions: List[Dict[str, float]]) -> List[Dict[str, Any]]:
+    if not regions:
+        return segments
+    out: List[Dict[str, Any]] = []
+    for s in segments:
+        s0, s1 = float(s["start"]), float(s["end"])
+        if s1 <= s0:
+            continue
+        for r in regions:
+            r0, r1 = float(r["start"]), float(r["end"])
+            ov = _overlap(s0, s1, r0, r1)
+            if ov <= 0:
+                continue
+            out.append({"start": max(s0,r0), "end": min(s1,r1), "speaker": s["speaker"]})
+    out.sort(key=lambda d: (d["start"], d["end"], d["speaker"]))
+    merged: List[Dict[str, Any]] = []
+    for seg in out:
+        if merged and merged[-1]["speaker"] == seg["speaker"] and abs(merged[-1]["end"] - seg["start"]) < 1e-6:
+            merged[-1]["end"] = seg["end"]
+        else:
+            merged.append(seg)
+    return merged
+
+def _normalize_verbose(raw: dict) -> Tuple[List[dict], List[dict], str, float, Optional[str]]:
+    segments = list(raw.get("segments") or [])
+    words: List[dict] = []
+    if isinstance(raw.get("words"), list):
+        words = raw["words"]
+    else:
+        for i, s in enumerate(segments):
+            for w in (s.get("words") or []):
+                ww = dict(w)
+                if "segment_id" not in ww:
+                    ww["segment_id"] = s.get("id", i)
+                words.append(ww)
+
+    text = raw.get("text")
+    if not text:
+        text = " ".join((s.get("text") or "").strip() for s in segments).strip()
+
+    duration = raw.get("duration")
+    if duration is None:
         if segments:
-            durations = [s['duration'] for s in segments if 'duration' in s]
-            if durations:
-                logger.info(f"Ortalama segment süresi: {np.mean(durations):.1f}s")
-                logger.info(f"En kısa segment: {min(durations):.1f}s")
-                logger.info(f"En uzun segment: {max(durations):.1f}s")
+            try:
+                duration = float(segments[-1].get("end") or 0.0)
+            except Exception:
+                duration = 0.0
+        else:
+            duration = 0.0
+    else:
+        try:
+            duration = float(duration)
+        except Exception:
+            duration = 0.0
 
-    except Exception as e:
-        logger.error(f"\n{'='*60}")
-        logger.error(f"❌ HATA OLUŞTU!")
-        logger.error(f"{'='*60}")
-        logger.error(f"{type(e).__name__}: {e}", exc_info=True)
-        sys.exit(1)
+    language = raw.get("language")
 
+    if not segments and text:
+        segments = [{"id": 0, "start": 0.0, "end": duration or 0.0, "text": text}]
+
+    return segments, words, text or "", float(duration), language
+
+def _write_rttm(diar_segments: List[dict], rttm_path: Path, uri: Optional[str] = None):
+    if uri is None:
+        uri = rttm_path.stem
+    with rttm_path.open("w") as f:
+        for d in diar_segments:
+            start = float(d["start"]); dur = float(d["end"]) - float(d["start"])
+            spk = str(d["speaker"])
+            line = f"SPEAKER {uri} 1 {start:.3f} {dur:.3f} <NA> <NA> {spk}\n"
+            f.write(line)
+
+def _write_outputs(outdir: Path, stem: str, segments: List[dict], words: List[dict], text: str, language: Optional[str], duration: float | None, diarization: Optional[List[dict]]=None, timeline: Optional[List[TimelineSeg]]=None) -> dict:
+    verbose_json_path = outdir / f"{stem}.verbose.json"
+    verbose = {"text": text, "language": language, "duration": duration, "segments": segments, "words": words}
+    if diarization is not None:
+        verbose["diarization"] = diarization
+    if timeline is not None:
+        verbose["timeline"] = [
+            {"start": t.start, "end": t.end, "mode": t.mode, "speakers": list(t.speakers),
+             "channels": t.channels if t.channels else None}
+            for t in timeline
+        ]
+    verbose_json_path.write_text(json.dumps(verbose, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def srt_time(t: float | None) -> str:
+        t = 0.0 if t is None else max(0.0, float(t))
+        h = int(t // 3600); m = int((t % 3600) // 60); s = int(t % 60)
+        ms = int(round((t - int(t)) * 1000))
+        return f"{h:02}:{m:02}:{s:02},{ms:03}"
+    srt_lines = []
+    for i, seg in enumerate(segments, 1):
+        srt_lines += [str(i), f"{srt_time(seg.get('start'))} --> {srt_time(seg.get('end'))}", (seg.get("text") or "").strip(), ""]
+    (outdir / f"{stem}.segments.srt").write_text("\n".join(srt_lines), encoding="utf-8")
+
+    with (outdir / f"{stem}.segments.csv").open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); w.writerow(["id","start","end","text","speaker"])
+        for i, s in enumerate(segments):
+            w.writerow([s.get("id", i), s.get("start"), s.get("end"), (s.get("text") or "").strip(), s.get("speaker")])
+    with (outdir / f"{stem}.words.csv").open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); w.writerow(["start","end","word","segment_id","speaker"])
+        for kw in words:
+            w.writerow([kw.get("start"), kw.get("end"), kw.get("word") or kw.get("text"), kw.get("segment_id"), kw.get("speaker")])
+
+    if timeline is not None:
+        tcsv = outdir / f"{stem}.timeline.csv"
+        with tcsv.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f); w.writerow(["start","end","mode","speakers","L","R"])
+            for t in timeline:
+                spks = "|".join(t.speakers)
+                L = t.channels.get("L") if t.channels else ""
+                R = t.channels.get("R") if t.channels else ""
+                w.writerow([t.start, t.end, t.mode, spks, L, R])
+
+    files = {
+        "verbose_json": str(verbose_json_path),
+        "segments_srt": str(outdir / f"{stem}.segments.srt"),
+        "segments_csv": str(outdir / f"{stem}.segments.csv"),
+        "words_csv": str(outdir / f"{stem}.words.csv"),
+    }
+    if timeline is not None:
+        files["timeline_csv"] = str(outdir / f"{stem}.timeline.csv")
+    return {"text": text, "language": language, "duration": duration, "files": files}
+
+# ------------------ Main Pipeline with Optimized Speaker Mapping ------------------
+
+def process_video_wordwise(
+        video_path: str,
+        output_dir: str,
+        llm_model: str = "gpt-4o",
+        stt_model: str = "whisper-1",
+        language: Optional[str] = None,
+        prompt: Optional[str] = None,
+        want_word_timestamps: bool = True,
+        chunk_overlap_sec: float = 0.0,
+        diarize: bool = True,
+        speaker_count: Optional[int] = None,
+        use_vad: bool = True,
+        stereo_threshold: float = 0.20,
+        debug: bool = True,
+        # Optimized mapper parameters
+        use_optimized_mapping: bool = True,
+        min_overlap_ratio: float = 0.2,
+        boundary_tolerance: float = 0.1,
+        use_vad_boundaries: bool = True,
+        use_timeline: bool = True,
+        confidence_threshold: float = 0.6,
+) -> dict:
+    dbg = DebugWriter(enabled=debug)
+    src = Path(video_path)
+    out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
+    if not src.exists():
+        raise FileNotFoundError(f"Girdi bulunamadı: {src}")
+
+    # Audio processing
+    audio = transcode_audio_under_limit(src, out / "_work", dbg=dbg)
+    size = audio.stat().st_size
+    if size > SOFT_LIMIT_BYTES:
+        dur = probe_duration_seconds(audio)
+        avg_kbps = max(1, int((size * 8) / max(1.0, dur) / 1000))
+        safe_sec = int((SOFT_LIMIT_BYTES * 8) / (avg_kbps * 1000) * 0.95)
+        safe_sec = max(30, min(900, safe_sec))
+        chunks = split_audio_by_duration(audio, safe_sec, out / "_chunks", copy_codecs=True, dbg=dbg)
+    else:
+        chunks = [(audio, 0.0)]
+        dbg.snap("AUDIO_SINGLE", size_bytes=size)
+
+    # Transcription
+    merged_segments: List[dict] = []
+    merged_words: List[dict] = []
+    merged_texts: List[str] = []
+    lang: Optional[str] = None
+    last_id = 0
+    last_seg_end = 0.0
+
+    for idx, (part_path, base_offset) in enumerate(chunks):
+        effective_offset = base_offset - (chunk_overlap_sec if idx > 0 else 0.0)
+        raw = transcribe_file(part_path, model=stt_model, language=language, prompt=prompt, want_word_timestamps=want_word_timestamps, dbg=dbg)
+        segs, words, text, part_dur, part_lang = _normalize_verbose(raw)
+        if lang is None:
+            lang = part_lang
+        for s in segs:
+            s = dict(s); s["start"] = float(s.get("start",0.0)) + effective_offset; s["end"] = float(s.get("end",0.0)) + effective_offset
+            s["id"] = last_id; last_id += 1; merged_segments.append(s); last_seg_end = max(last_seg_end, s["end"])
+        for w in words:
+            w = dict(w)
+            if "start" in w and w["start"] is not None: w["start"] = float(w["start"]) + effective_offset
+            if "end"   in w and w["end"]   is not None: w["end"]   = float(w["end"])   + effective_offset
+            merged_words.append(w)
+        merged_texts.append(text)
+
+    diar_segments: Optional[List[dict]] = None
+    vad_regions: Optional[List[Dict[str,float]]] = None
+
+    # VAD and Diarization
+    wav_for_diar = ensure_wav_mono16k(audio, out / "_work")
+    if use_vad:
+        vad_regions = _vad_pyannote(wav_for_diar, dbg)
+
+    if diarize:
+        diar_segments = _diarize_pyannote(wav_for_diar, speaker_count, dbg)
+        if vad_regions:
+            diar_segments = clip_segments_to_regions(diar_segments, vad_regions)
+
+        timeline = build_flat_timeline(diar_segments, stereo_threshold=stereo_threshold)
+
+        # SPEAKER MAPPING
+        if use_optimized_mapping:
+            dbg.snap("SPEAKER_MAPPING", method="optimized_real_data")
+
+            timeline_json = None
+            if timeline:
+                timeline_json = [
+                    {
+                        "start": t.start,
+                        "end": t.end,
+                        "mode": t.mode,
+                        "speakers": list(t.speakers),
+                        "channels": t.channels if t.channels else {}
+                    }
+                    for t in timeline
+                ]
+
+            mapper = OptimizedSpeakerMapper(
+                min_overlap_ratio=min_overlap_ratio,
+                boundary_tolerance=boundary_tolerance,
+                use_vad_boundaries=use_vad_boundaries,
+                use_timeline=use_timeline,
+                confidence_threshold=confidence_threshold
+            )
+
+            merged_segments, merged_words = mapper.map_speakers(
+                merged_segments,
+                merged_words,
+                diar_segments,
+                timeline_json,
+                vad_regions
+            )
+
+            stats = mapper.get_statistics()
+            dbg.snap("MAPPING_STATS", **stats)
+
+            assigned_segments = sum(1 for s in merged_segments if "speaker" in s)
+            high_conf_segments = sum(
+                1 for s in merged_segments
+                if s.get("confidence", 0) >= confidence_threshold
+            )
+
+            dbg.snap("MAPPING_RESULTS",
+                     total_segments=len(merged_segments),
+                     assigned_segments=assigned_segments,
+                     high_confidence_segments=high_conf_segments,
+                     assigned_words=sum(1 for w in merged_words if "speaker" in w))
+        else:
+            # Simple fallback
+            dbg.snap("SPEAKER_MAPPING", method="simple_temporal")
+            for s in merged_segments:
+                s0, s1 = float(s.get("start",0.0)), float(s.get("end",0.0))
+                best_spk, best_ov = None, 0.0
+                for d in diar_segments:
+                    ov = _overlap(s0,s1,d["start"],d["end"])
+                    if ov > best_ov:
+                        best_ov, best_spk = ov, d["speaker"]
+                if best_spk is not None:
+                    s["speaker"] = best_spk
+
+        # Write RTTM and speaker CSV
+        rttm_path = out / f"{wav_for_diar.stem}.diarization.rttm"
+        _write_rttm(diar_segments, rttm_path, uri=src.stem)
+        spk_csv = out / f"{src.stem}.speakers.csv"
+        with spk_csv.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f); w.writerow(["start","end","speaker"])
+            for d in diar_segments:
+                w.writerow([d["start"], d["end"], d["speaker"]])
+        dbg.snap("DIAR_FILES", rttm=str(rttm_path), speakers_csv=str(spk_csv))
+    else:
+        timeline = None
+
+    # Write outputs
+    summary = _write_outputs(out, src.stem, merged_segments, merged_words, " ".join(merged_texts).strip(), lang, last_seg_end, diarization=diar_segments, timeline=timeline)
+    summary["models"] = {"stt": stt_model, "llm": llm_model}
+    if diar_segments:
+        summary["files"]["speakers_csv"] = str(out / f"{src.stem}.speakers.csv")
+        rttm_guess = out / f"{audio.stem}.diarization.rttm"
+        if rttm_guess.exists():
+            summary["files"]["speakers_rttm"] = str(rttm_guess)
+    if timeline is not None:
+        summary["files"]["timeline_csv"] = str(out / f"{src.stem}.timeline.csv")
+
+    if debug and dbg.events:
+        debug_json = out / f"{src.stem}.debug.json"
+        debug_json.write_text(json.dumps(dbg.events, indent=2), encoding="utf-8")
+        summary["files"]["debug"] = str(debug_json)
+
+    return summary
+
+# Usage example
 if __name__ == "__main__":
-    main()
+    res = process_video_wordwise(
+        video_path="sample2.mp4",
+        output_dir="output2",
+        stt_model="whisper-1",
+        language=None,
+        prompt=None,
+        want_word_timestamps=True,
+        chunk_overlap_sec=0.0,
+        diarize=True,
+        speaker_count=None,
+        use_vad=True,
+        stereo_threshold=0.20,
+        debug=True,
+        # Optimized mapping parameters
+        use_optimized_mapping=True,
+        min_overlap_ratio=0.2,
+        boundary_tolerance=0.1,
+        use_vad_boundaries=True,
+        use_timeline=True,
+        confidence_threshold=0.6,
+    )
+    print(json.dumps(res, ensure_ascii=False, indent=2))
