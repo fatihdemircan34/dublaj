@@ -1,0 +1,13 @@
+{
+  "type": "service_account",
+  "project_id": "voiceprocess-58fbc",
+  "private_key_id": "8e5f0264cdc02f6a6b76a45a01e5d21136845837",
+  "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDM9/Htsc/QJ4Zh\njeMBY1Ni1daiEg6TS3GqYvN+X2dHkXUSmiYXyA158L1QOXNEPbbZ8MIOwkXJZcf6\ne9yEz1xNeJnS99WBvcue2h12HPlu/Gu1z1cSxO7Mh7YeJBfI1t2KN9uMEieSCBfY\n5CU3T4Ie9nGnqNcQ7XRPvZy6lxmz7gae9iAruMbO/UhRdNShTDUh5a02MIVLIunv\niklHhbhQIzVl+lOf3tYtf5jjK9lUqdKDS+VdWPFHbkigXvr8X+qGbkE2aobpUOXm\n36CtgSzJC4IktwOMq8iDBavfMUeDfn5QnL7tTsMxr6RCh/RKxH4sfz8ihX1VTGj8\nHYchZXvHAgMBAAECggEAD/NLlF+9+EjbIERWYglEt/BEH6CgGb5JPiUtJaxu8RbU\nsXnldPxQcCjX0qJl4e2biSI/N77Oh3mwMkHpSzyHxk+YSN6Yctw+OEJpAIQItSZX\ni3JzKDbDDo+REI9mem6eFt956lCPW8HdeTdn3gIF8jrjZVSyR9LytjHfPHX9vg6o\nE/WjSu+XOsN8ZFTS+gZmtvYuCnfajePUfG6X3k0DiMCyxl66LRKlKT7jJrlAxaN/\nkNKrN/7w+6QZK1sRGH/65IZh4igSJ8vyLwEnjC0p9Z8FJmQOn36OhCkLQNagJIaZ\n2YlMRO1fc2W1qQ/s6TVdX03o7fsAzkPwWHG8KAhUgQKBgQD51H05ssMeKou1pZah\n1Mgp3vOEkm+dGc0HZimFuwkxEyVq7F8fzP9DNzM8N6sYh42rJoB/jWV+mFEBdJar\nZOWUKRSTB/lIZUC+mXgygJXVyIlwXNU8qcRuO0bA1Urkss7O1naBENyE1Cyv5ixi\n+tyGTgLPjIe20ElFFYXLXCKOVwKBgQDSB9N91ccrPBmr+rcUiclHBt3URxjMmQVz\nsMcmFshVJ37rP+ff5+oafzsTGh1j5Mn49xXi98xyWoenLF96lNBNtKCjHHl18GGS\nkuibfGTobkm185ei9+1Gd430yFmWQjFF25KTFS+QcokgMYLSgpcflz5hvL79q+1T\nENqQg2E4EQKBgQDSqzxtyzB936KwKlI7ZRLlO/xdbp5v+7HI631YJ8A4gcyrvWb5\nigQ2yfWKceb1aFkuWelBphpQBmFIuOfU3+A4b+vJkI/FXJycHQ4eiA/RlqlO9vlZ\njk72JUYklbfx4lZCVNbZPz61Q7XrHk2PqbsMBfyYyAgpQLqIZv3L3oXFQQKBgQCl\nkIHJelHs5Q2fop3b1NoT4XfQtNL5xc6kakAy6Fa3udC1BcV1nc3PYWhiIH32lw4X\n8j8QkiJaKr8wqywA53plJvRSYEnnDLz93Ez89Mxe5UG56vIoB6TFnc0Lnzvv1PIe\njX4378V06rTp6d2ksEkNIB6O0UkFkxgcGPcSYF6s4QKBgFz9ye5gPEWFT7nLhiYT\nPHUAwlWqztoizIpEA5optXkCE8qlqf721b9pc9yzwydX3+eL+2XpAH+oWKQJEZqf\nxOTxZOfFS3Of+V7KyUoNtES6W1kRvZz9RngGm6EcCdz2zjn14uiVGXqwlXsV/XW8\n7Fy38XsvvuJpbU8q/z5AqU/7\n-----END PRIVATE KEY-----\n",
+  "client_email": "eventarc-workflows-invoker@voiceprocess-58fbc.iam.gserviceaccount.com",
+  "client_id": "112185555454289167059",
+  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+  "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/eventarc-workflows-invoker%40voiceprocess-58fbc.iam.gserviceaccount.com",
+  "universe_domain": "googleapis.com"
+}

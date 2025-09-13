@@ -1,0 +1,78 @@
+[
+  {
+    "tag": "AUDIO_PROBE",
+    "ts": 1757798462.3932173,
+    "duration_sec": 291.27
+  },
+  {
+    "tag": "AUDIO_ENCODED",
+    "ts": 1757798466.9133532,
+    "bitrate_kbps": 64,
+    "size_bytes": 2469370
+  },
+  {
+    "tag": "AUDIO_SINGLE",
+    "ts": 1757798466.9134037,
+    "size_bytes": 2469370
+  },
+  {
+    "tag": "TRANSCRIBE_SDK",
+    "ts": 1757798466.9734197,
+    "file": "output2/_work/sample2.mono1_16kHz_64kbps.m4a"
+  },
+  {
+    "tag": "VAD_INIT",
+    "ts": 1757798503.2527418,
+    "device": "cuda"
+  },
+  {
+    "tag": "VAD_DONE",
+    "ts": 1757798504.098499,
+    "regions": 45,
+    "total_speech_sec": 225.2,
+    "secs": 0.845
+  },
+  {
+    "tag": "DIAR_INIT",
+    "ts": 1757798505.594168,
+    "device": "cuda"
+  },
+  {
+    "tag": "DIAR_DONE",
+    "ts": 1757798528.276359,
+    "diar_segments": 92,
+    "est_speakers": 10,
+    "total_speaking_time_sec": 221.49,
+    "secs": 22.682
+  },
+  {
+    "tag": "SPEAKER_MAPPING",
+    "ts": 1757798528.2817576,
+    "method": "optimized_real_data"
+  },
+  {
+    "tag": "MAPPING_STATS",
+    "ts": 1757798528.3571317,
+    "assignment_sources": {
+      "timeline": 67,
+      "low_confidence": 77,
+      "diarization": 5,
+      "isolation_fix": 1
+    },
+    "total_assignments": 150
+  },
+  {
+    "tag": "MAPPING_RESULTS",
+    "ts": 1757798528.3573484,
+    "total_segments": 143,
+    "assigned_segments": 143,
+    "high_confidence_segments": 71,
+    "assigned_words": 671
+  },
+  {
+    "tag": "DIAR_FILES",
+    "ts": 1757798528.3586228,
+    "rttm": "output2/sample2.mono1_16kHz_64kbps.mono16k.diarization.rttm",
+    "speakers_csv": "output2/sample2.speakers.csv"
+  }
+]
