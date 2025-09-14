@@ -1,5 +1,8 @@
 # test_claude.py
 import sys, os, glob, importlib.util
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent))
 
 # 1) Proje kökünü belirleyelim (bu dosyanın bulunduğu klasör)
 ROOT = os.path.dirname(os.path.abspath(__file__))
