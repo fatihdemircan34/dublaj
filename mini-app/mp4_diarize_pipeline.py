@@ -919,13 +919,33 @@ def build_reference_voices(original_audio: Path,
             try:
                 import torch as _torch
                 try:
-                    gpt, diff, spk = xtts_model.get_conditioning_latents(audio_path=[abs_path])
+                    latents = xtts_model.get_conditioning_latents(audio_path=[abs_path])
                 except TypeError:
-                    gpt, diff, spk = xtts_model.get_conditioning_latents(abs_path)
+                    latents = xtts_model.get_conditioning_latents(abs_path)
+
+                if isinstance(latents, tuple):
+                    if len(latents) == 3:
+                        gpt, diff, spk = latents
+                        payload = {
+                            "gpt": gpt.detach().cpu(),
+                            "diff": diff.detach().cpu(),
+                            "spk": spk.detach().cpu(),
+                        }
+                    elif len(latents) == 2:
+                        gpt, spk = latents
+                        payload = {
+                            "gpt": gpt.detach().cpu(),
+                            "spk": spk.detach().cpu(),
+                        }
+                    else:
+                        raise ValueError(
+                            f"Unexpected number of conditioning latents: {len(latents)}"
+                        )
+                else:
+                    raise ValueError("Unexpected return type from get_conditioning_latents")
+
                 lat_path = voices_dir / f"{speaker}.latents.pt"
-                _torch.save({"gpt": gpt.detach().cpu(),
-                             "diff": diff.detach().cpu(),
-                             "spk": spk.detach().cpu()}, lat_path)
+                _torch.save(payload, lat_path)
                 latents_map[speaker] = str(lat_path.resolve())
                 print(f"[XTTS] {speaker} latent kaydedildi -> {lat_path}")
             except Exception as e:
