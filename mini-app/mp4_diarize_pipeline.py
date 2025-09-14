@@ -704,20 +704,19 @@ def _write_outputs(outdir: Path, stem: str, segments: List[dict], words: List[di
 
 # ======================= XTTS & Lipsync Yardımcıları =======================
 
-# 1) XTTSEngine import veya fallback (xtts.py arayüzüne uyumlu)
-#    Eğer projendeki xtts.py import edilemezse, TTS.api ile aynı API'yi sağlayan basit bir sınıf kullanıyoruz.
+# 1) XTTSEngine import veya fallback (models.tts.xtts arayüzüne uyumlu)
+#    Eğer projedeki XTTS motoru import edilemezse, TTS.api ile aynı API'yi sağlayan basit bir sınıf kullanıyoruz.
 _HAS_XTTS = False
 try:
-    # Kullanıcı projesindeki xtts.py (register_tts, BaseTTSEngine vb. olabilir)
-    # Bu import başarısız olursa fallback'a düşeceğiz.
-    from xtts import XTTSEngine as _ProjectXTTSEngine  # noqa: F401
+    # Projede bulunan models.tts.xtts modülünü kullanmaya çalış
+    from models.tts.xtts import XTTSEngine as _ProjectXTTSEngine  # noqa: F401
     _HAS_XTTS = True
 except Exception:
     _ProjectXTTSEngine = None
 
 class _FallbackXTTSEngine:
-    """Projede xtts.py yoksa basit Coqui TTS tabanlı fallback.
-    xtts.py'deki `XTTSEngine.synthesize(...)` imzasını taklit eder.  :contentReference[oaicite:2]{index=2}
+    """Projede XTTS modülü yoksa basit Coqui TTS tabanlı fallback.
+    `XTTSEngine.synthesize(...)` imzasını taklit eder.  :contentReference[oaicite:2]{index=2}
     """
     def __init__(self, model_name: str="tts_models/multilingual/multi-dataset/xtts_v2", language: str="tr"):
         self.model_name = model_name
@@ -734,7 +733,7 @@ class _FallbackXTTSEngine:
         assert not (speaker_wav and latents_path), "speaker_wav ve latents birlikte verilemez."
         lang = (lang or self.language or "tr")
         if latents_path:
-            # Latent ile inference (xtts.py ile aynı dahili arayüz)
+            # Latent ile inference (XTTS ile aynı dahili arayüz)
             import torch, torchaudio
             lat = torch.load(latents_path, map_location="cpu")
             mdl = self._tts.synthesizer.tts_model
@@ -863,7 +862,7 @@ def build_reference_voices(original_audio: Path,
     voices_dir.mkdir(parents=True, exist_ok=True)
 
     latents_map: Dict[str, str] = {}
-    # XTTS modeli (latents üretimi için) – xtts.py API’siyle birebir  :contentReference[oaicite:5]{index=5}
+    # XTTS modeli (latents üretimi için) – XTTS modülü API’siyle birebir  :contentReference[oaicite:5]{index=5}
     try:
         xtts_engine = _load_xtts_engine("tts_models/multilingual/multi-dataset/xtts_v2", target_lang)
         xtts_model = xtts_engine._tts.synthesizer.tts_model
