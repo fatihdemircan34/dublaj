@@ -29,7 +29,7 @@ torch.load = _torch_load_compat
 # --- /shim ---
 
 from core.registry.tts import register_tts
-from .gtts import BaseTTSEngine
+from models.tts.gtts import BaseTTSEngine
 
 logger = logging.getLogger(__name__)
 
