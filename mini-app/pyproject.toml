@@ -1,9 +1,18 @@
+[tool.poetry]
+name = "mp4-diarize-pipeline"
+version = "0.1.0"
+description = "MP4 -> VAD/OSD/Diarization/(Separation) + Whisper ASR; overlap-aware konuşmacı atama ve JSON çıktı."
+authors = ["Fatih <fatidemircan@gmail.com>"]
+readme = "README.md"
+license = "MIT"
+package-mode = false
+
 [tool.poetry.dependencies]
 python = ">=3.10,<3.13"
 
 # --- SES / TTS ---
-coqui-tts = "0.24.0"          # XTTS v2 ile stabil
-coqpit = "0.0.17"             # coqui-tts ile uyumlu, issubclass hatasını keser
+coqui-tts = "0.24.0"          # XTTS v2 stabil
+coqpit = "0.0.17"             # issubclass hatası fix
 pydub = "0.25.1"
 soundfile = "0.12.1"
 librosa = "0.10.2"
@@ -22,7 +31,7 @@ transformers = "4.36.0"
 speechbrain = "0.5.16"
 
 # --- TORCH EKOSİSTEMİ ---
-torch = "2.1.0"               # poetry install CPU tekerleği getirir; CUDA'yı aşağıdaki adımda kuracağız
+torch = "2.1.0"
 torchaudio = "2.1.0"
 torchvision = "0.16.0"
 
@@ -34,22 +43,14 @@ omegaconf = "2.3.0"
 asteroid-filterbanks = "0.4.0"
 einops = "0.7.0"
 
-# --- LIPSYNC (Wav2Lip) için pratik bağımlılıklar ---
+# --- LIPSYNC (Wav2Lip) ---
 opencv-python-headless = {version = "^4.9.0", optional = true}
 tqdm = {version = "^4.66.0", optional = true}
 numba = {version = "^0.58.0", optional = true}
 numpy = "^1.26.4"
 
 [tool.poetry.extras]
-lipsync = ["opencv-python-headless", "tqdm", "numba"]  # `poetry install -E lipsync` ile kurulur
+lipsync = ["opencv-python-headless", "tqdm", "numba"]
 
 [tool.poetry.scripts]
 mp4-diarize = "mp4_diarize_pipeline:main"
-
-# (OPSİYONEL) Projendeki yerel modülleri paket olarak görmek istersen:
-# Aşağıdaki bölümü kullanmak için 2. bölümde anlatılan "mini_app" paketlemesini yap.
-# [tool.poetry.packages]
-# { include = "mini_app" }
-[tool.poetry]
-name = "mp4-diarize-pipeline"
-version = "0.1.0"

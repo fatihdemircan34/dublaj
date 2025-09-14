@@ -23,9 +23,9 @@ xtts = importlib.util.module_from_spec(spec)
 sys.modules["xtts"] = xtts
 spec.loader.exec_module(xtts)
 
-from xtts import XTTSEngine
+import xtts
 
 import torch
 print("CUDA?", torch.cuda.is_available())
-eng = XTTSEngine(model_name="tts_models/multilingual/multi-dataset/xtts_v2", language="tr")
+eng = xtts.XTTSEngine(model_name="tts_models/multilingual/multi-dataset/xtts_v2", language="tr")
 print("Model hazır.")
