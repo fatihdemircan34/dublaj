@@ -103,22 +103,41 @@ class BuildRefVoicesStep:
             if mdl:
                 try:
                     try:
-                        gpt, diff, spk = mdl.get_conditioning_latents(audio_path=[abs_path])
+                        latents = mdl.get_conditioning_latents(audio_path=[abs_path])
                     except TypeError:
-                        gpt, diff, spk = mdl.get_conditioning_latents(abs_path)
+                        latents = mdl.get_conditioning_latents(abs_path)
+
+                    if isinstance(latents, tuple):
+                        if len(latents) == 3:
+                            gpt, diff, spk = latents
+                            payload = {
+                                "gpt": gpt.detach().cpu(),
+                                "diff": diff.detach().cpu(),
+                                "spk": spk.detach().cpu(),
+                            }
+                        elif len(latents) == 2:
+                            gpt, spk = latents
+                            payload = {
+                                "gpt": gpt.detach().cpu(),
+                                "spk": spk.detach().cpu(),
+                            }
+                        else:
+                            raise ValueError(
+                                f"Unexpected number of conditioning latents: {len(latents)}"
+                            )
+                    else:
+                        raise ValueError(
+                            "Unexpected return type from get_conditioning_latents"
+                        )
+
                     lat_path = voices_dir / f"{speaker}.latents.pt"
-                    torch.save(
-                        {
-                            "gpt": gpt.detach().cpu(),
-                            "diff": diff.detach().cpu(),
-                            "spk": spk.detach().cpu(),
-                        },
-                        lat_path,
-                    )
+                    torch.save(payload, lat_path)
                     latents_map[speaker] = str(lat_path.resolve())
                     logger.info("XTTS: saved latents for %s -> %s", speaker, lat_path)
                 except Exception as exc:  # pragma: no cover - runtime errors
-                    logger.warning("XTTS: failed to compute latents for %s: %s", speaker, exc)
+                    logger.warning(
+                        "XTTS: failed to compute latents for %s: %s", speaker, exc
+                    )
 
             genders = [seg.get("gender") for seg in segs if seg.get("gender") in ("M", "F")]
             majority: Optional[str] = None
