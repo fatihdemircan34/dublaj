@@ -167,13 +167,15 @@ class XTTSEngine(BaseTTSEngine):
 
     def _synth_with_latents(self, text: str, lang: str, lat: Dict[str, torch.Tensor]):
         mdl = self._tts.synthesizer.tts_model
-        wav = mdl.inference(
-            text=text,
-            language=lang,
-            gpt_cond_latent=lat["gpt"],
-            diffusion_conditioning=lat["diff"],
-            speaker_embedding=lat["spk"],
-        )
+        inf_kwargs = {
+            "text": text,
+            "language": lang,
+            "gpt_cond_latent": lat["gpt"],
+            "speaker_embedding": lat["spk"],
+        }
+        if "diff" in lat:
+            inf_kwargs["diffusion_conditioning"] = lat["diff"]
+        wav = mdl.inference(**inf_kwargs)
         if not isinstance(wav, torch.Tensor):
             wav = torch.tensor(wav)
         if wav.dim() == 1:

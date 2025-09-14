@@ -737,13 +737,15 @@ class _FallbackXTTSEngine:
             import torch, torchaudio
             lat = torch.load(latents_path, map_location="cpu")
             mdl = self._tts.synthesizer.tts_model
-            wav = mdl.inference(
-                text=text,
-                language=lang,
-                gpt_cond_latent=lat["gpt"],
-                diffusion_conditioning=lat["diff"],
-                speaker_embedding=lat["spk"],
-            )
+            inf_kwargs = {
+                "text": text,
+                "language": lang,
+                "gpt_cond_latent": lat["gpt"],
+                "speaker_embedding": lat["spk"],
+            }
+            if "diff" in lat:
+                inf_kwargs["diffusion_conditioning"] = lat["diff"]
+            wav = mdl.inference(**inf_kwargs)
             if not isinstance(wav, torch.Tensor):
                 wav = torch.tensor(wav)
             if wav.dim() == 1:
@@ -918,10 +920,20 @@ def build_reference_voices(original_audio: Path,
         if xtts_model is not None:
             try:
                 import torch as _torch
+
+                def _call_latents() -> Any:
+                    try:
+                        return xtts_model.get_conditioning_latents(audio_path=[abs_path])
+                    except TypeError:
+                        return xtts_model.get_conditioning_latents(abs_path)
+
                 try:
-                    latents = xtts_model.get_conditioning_latents(audio_path=[abs_path])
-                except TypeError:
-                    latents = xtts_model.get_conditioning_latents(abs_path)
+                    latents = _call_latents()
+                except ValueError as exc:
+                    if "expected 3" in str(exc) and "got 2" in str(exc):
+                        latents = xtts_model.get_conditioning_latents(abs_path)
+                    else:
+                        raise
 
                 if isinstance(latents, tuple):
                     if len(latents) == 3:
