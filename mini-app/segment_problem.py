@@ -1906,7 +1906,117 @@ def build_reference_voices(original_audio: Path,
 
     return voices_dir, latents_map
 
-def synthesize_dub_track_xtts(
+import logging
+from pathlib import Path
+from typing import Dict, Tuple, List
+
+logger = logging.getLogger(__name__)
+
+def _adaptive_time_stretch(in_wav: Path,
+                           target_sec: float,
+                           out_wav: Path,
+                           segment_text: str = "",
+                           enable: bool = True) -> Path:
+    """
+    Segment süresine göre adaptif time stretching.
+
+    Küçük segmentler: Stretch yapma veya çok az yap
+    Büyük segmentler: Gerekli stretch'i uygula
+    """
+    if not enable or target_sec <= 0:
+        _run(["ffmpeg", "-y", "-i", str(in_wav), "-ar", "16000", "-ac", "1", str(out_wav)])
+        return out_wav
+
+    current_duration = _ffprobe_duration(in_wav)
+
+    # Segment kategorileri
+    TINY_SEGMENT = 1.0      # 1 saniyeden kısa
+    SHORT_SEGMENT = 3.0     # 3 saniyeden kısa
+    MEDIUM_SEGMENT = 10.0   # 10 saniyeden kısa
+
+    # Stretch limitleri (1.0 = değişiklik yok)
+    MAX_SPEEDUP = 1.5       # En fazla 1.5x hızlandır
+    MAX_SLOWDOWN = 0.7      # En fazla 1.43x yavaşlat
+
+    # Text uzunluğuna göre ek kontrol
+    word_count = len(segment_text.split()) if segment_text else 0
+    is_short_utterance = word_count <= 3  # "Evet", "Tamam", "Hayır" gibi
+
+    # Hedef tempo hesapla
+    raw_tempo = target_sec / current_duration
+
+    # Segment süresine göre tempo sınırları belirle
+    if target_sec < TINY_SEGMENT or is_short_utterance:
+        # Çok kısa segment - stretch yapma!
+        logger.info(f"[STRETCH] Kısa segment ({target_sec:.1f}s, {word_count} kelime) - stretch KAPALI")
+        _run(["ffmpeg", "-y", "-i", str(in_wav),
+              "-t", str(target_sec),
+              "-ar", "16000", "-ac", "1", str(out_wav)])
+        return out_wav
+
+    elif target_sec < SHORT_SEGMENT:
+        # Kısa segment - minimal stretch
+        min_tempo = 0.85  # Max %18 yavaşlama
+        max_tempo = 1.15  # Max %15 hızlandırma
+
+    elif target_sec < MEDIUM_SEGMENT:
+        # Orta segment - normal stretch
+        min_tempo = 0.75
+        max_tempo = 1.35
+
+    else:
+        # Uzun segment - agresif stretch OK
+        min_tempo = MAX_SLOWDOWN
+        max_tempo = MAX_SPEEDUP
+
+    # Tempo'yu sınırla
+    tempo = max(min_tempo, min(max_tempo, raw_tempo))
+
+    # Eğer sınırlar nedeniyle hedef süreye ulaşılamıyorsa logla
+    expected_duration = current_duration * tempo
+    duration_diff = abs(expected_duration - target_sec)
+
+    if duration_diff > 0.5:
+        logger.warning(f"[STRETCH] Hedef süreye ulaşılamıyor:")
+        logger.warning(f"  Segment: {target_sec:.1f}s ({word_count} kelime)")
+        logger.warning(f"  TTS çıktısı: {current_duration:.1f}s")
+        logger.warning(f"  İstenen tempo: {raw_tempo:.2f}x")
+        logger.warning(f"  Uygulanan tempo: {tempo:.2f}x (limit nedeniyle)")
+        logger.warning(f"  Sonuç: {expected_duration:.1f}s (hedeften {duration_diff:.1f}s fark)")
+    else:
+        logger.debug(f"[STRETCH] {current_duration:.1f}s -> {target_sec:.1f}s (tempo: {tempo:.2f}x)")
+
+    # FFmpeg için tempo değeri (ters)
+    ffmpeg_tempo = 1.0 / tempo
+
+    # Stretch uygula
+    if 0.5 <= ffmpeg_tempo <= 2.0:
+        # Tek aşamada yapılabilir
+        if _ffmpeg_has_filter("rubberband") and abs(tempo - 1.0) > 0.1:
+            # Rubberband daha kaliteli
+            cmd = ["ffmpeg", "-y", "-i", str(in_wav),
+                   "-af", f"rubberband=tempo={ffmpeg_tempo:.6f}:pitch=1.0,aresample=16000",
+                   "-t", str(target_sec),
+                   "-ac", "1", str(out_wav)]
+        else:
+            # Atempo kullan
+            atempo_filter = _atempo_chain(ffmpeg_tempo)
+            cmd = ["ffmpeg", "-y", "-i", str(in_wav),
+                   "-af", f"{atempo_filter},aresample=16000",
+                   "-t", str(target_sec),
+                   "-ac", "1", str(out_wav)]
+        _run(cmd)
+    else:
+        # Çok ekstrem tempo - atla
+        logger.warning(f"[STRETCH] Çok ekstrem tempo ({ffmpeg_tempo:.2f}x), stretch atlanıyor")
+        _run(["ffmpeg", "-y", "-i", str(in_wav),
+              "-t", str(target_sec),
+              "-ar", "16000", "-ac", "1", str(out_wav)])
+
+    return out_wav
+
+
+def synthesize_dub_track_xtts_adaptive(
         segments: List[dict],
         all_text: Optional[str],
         voices_dir: Path,
@@ -1914,8 +2024,12 @@ def synthesize_dub_track_xtts(
         target_lang: str,
         out_dir: Path,
         xtts_cfg: Optional[XTTSConfig] = None,
-        fit_to_segments: bool = True
+        fit_to_segments: bool = True,
+        adaptive_stretch: bool = True  # YENİ PARAMETRE
 ) -> Tuple[Path, Dict[int, Path]]:
+    """
+    TTS sentezleme - adaptif time stretching ile.
+    """
     import logging
     logger = logging.getLogger(__name__)
 
@@ -1926,18 +2040,20 @@ def synthesize_dub_track_xtts(
     tmp_audio_dir = out_dir / "_tts_segments"
     tmp_audio_dir.mkdir(parents=True, exist_ok=True)
 
-    duration_stats = {
-        "total_original": 0.0,
-        "total_tts": 0.0,
-        "total_stretched": 0.0,
-        "max_drift": 0.0,
-        "segments_processed": 0
+    # İstatistikler
+    stats = {
+        "tiny_segments": 0,     # Stretch yapılmayan
+        "limited_segments": 0,  # Limitli stretch
+        "normal_segments": 0,   # Normal stretch
+        "total_drift": 0.0,
+        "max_single_drift": 0.0
     }
 
     for seg in segments:
         sid = seg.get("id")
         if sid is None:
             continue
+
         text = (seg.get("text") or "").strip()
         if not text:
             continue
@@ -1945,17 +2061,18 @@ def synthesize_dub_track_xtts(
         seg_start = float(seg.get("start", 0.0))
         seg_end = float(seg.get("end", 0.0))
         original_duration = seg_end - seg_start
+
         if original_duration <= 0:
-            logger.warning(f"Invalid segment duration for ID {sid}: {original_duration}s")
+            logger.warning(f"Geçersiz segment süresi ID {sid}: {original_duration}s")
             continue
 
-        duration_stats["total_original"] += original_duration
-
+        # TTS sentezle
         spk = str(seg.get("speaker") or "UNKNOWN")
         spk_wav = voices_dir / f"{spk}.wav"
         lat_path = latents_map.get(spk)
 
         raw_out = tmp_audio_dir / f"seg_{sid:06d}.raw.wav"
+
         if lat_path:
             tts.synthesize(text, output_path=raw_out, latents_path=lat_path, lang=target_lang)
         else:
@@ -1967,42 +2084,93 @@ def synthesize_dub_track_xtts(
             tts.synthesize(text, output_path=raw_out, speaker_wav=str(spk_wav), lang=target_lang)
 
         tts_duration = _ffprobe_duration(raw_out)
-        duration_stats["total_tts"] += tts_duration
 
+        # Adaptif stretch
         stretched = tmp_audio_dir / f"seg_{sid:06d}.fit.wav"
 
-        if fit_to_segments:
-            target_duration = original_duration
-            _time_stretch_to_duration(raw_out, target_sec=target_duration, out_wav=stretched, enable=True)
-            stretch_ratio = tts_duration / target_duration
-            if abs(stretch_ratio - 1.0) > 0.1:
-                logger.info(f"Segment {sid} ({spk}): TTS {tts_duration:.2f}s -> Target {target_duration:.2f}s (ratio: {stretch_ratio:.2f})")
+        if fit_to_segments and adaptive_stretch:
+            # Adaptif stretch kullan
+            _adaptive_time_stretch(
+                raw_out,
+                target_sec=original_duration,
+                out_wav=stretched,
+                segment_text=text,
+                enable=True
+            )
+
+            # İstatistik güncelle
+            if original_duration < 1.0 or len(text.split()) <= 3:
+                stats["tiny_segments"] += 1
+            elif abs(tts_duration - original_duration) / original_duration > 0.3:
+                stats["limited_segments"] += 1
+            else:
+                stats["normal_segments"] += 1
+
+        elif fit_to_segments:
+            # Eski yöntem (tüm segmentlere aynı stretch)
+            _time_stretch_to_duration(raw_out, target_sec=original_duration, out_wav=stretched, enable=True)
         else:
+            # Stretch yok
             _time_stretch_to_duration(raw_out, target_sec=0.0, out_wav=stretched, enable=False)
 
+        # Drift hesapla
         final_duration = _ffprobe_duration(stretched)
-        duration_stats["total_stretched"] += final_duration
-
         drift = abs(final_duration - original_duration)
-        if drift > duration_stats["max_drift"]:
-            duration_stats["max_drift"] = drift
+        stats["total_drift"] += drift
+        stats["max_single_drift"] = max(stats["max_single_drift"], drift)
 
         seg_audio[sid] = stretched
-        duration_stats["segments_processed"] += 1
 
-    if duration_stats["segments_processed"] > 0:
-        logger.info(f"Duration Statistics:")
-        logger.info(f"  Total Original: {duration_stats['total_original']:.2f}s")
-        logger.info(f"  Total TTS: {duration_stats['total_tts']:.2f}s")
-        logger.info(f"  Total Stretched: {duration_stats['total_stretched']:.2f}s")
-        logger.info(f"  Max Single Drift: {duration_stats['max_drift']:.2f}s")
-        logger.info(f"  Overall Drift: {abs(duration_stats['total_stretched'] - duration_stats['total_original']):.2f}s")
+    # İstatistikleri logla
+    logger.info("=" * 60)
+    logger.info("ADAPTIVE STRETCH İSTATİSTİKLERİ:")
+    logger.info(f"  Stretch yapılmayan (tiny): {stats['tiny_segments']}")
+    logger.info(f"  Limitli stretch: {stats['limited_segments']}")
+    logger.info(f"  Normal stretch: {stats['normal_segments']}")
+    logger.info(f"  Toplam drift: {stats['total_drift']:.2f}s")
+    logger.info(f"  Max tek segment drift: {stats['max_single_drift']:.2f}s")
+    logger.info("=" * 60)
 
+    # Timeline'a yerleştir
     total_len = max((float(s.get("end", 0.0)) for s in segments), default=0.0)
     full_wav = out_dir / "dubbed.timeline.mono16k.wav"
-    _concat_timeline_audio_with_mixing(segments, seg_audio, total_len, full_wav)
+
+    # Güvenli concat kullan
+    _concat_timeline_audio_safe(segments, seg_audio, total_len, full_wav)
 
     return full_wav, seg_audio
+
+
+def _concat_timeline_audio_safe(segments: List[dict],
+                                seg_audio_paths: Dict[int, Path],
+                                total_len: float,
+                                out_wav: Path) -> Path:
+    """Güvenli ve basit ses birleştirme - fade olmadan"""
+    _ensure_pydub()
+    from pydub import AudioSegment
+
+    sr = 16000
+    out = AudioSegment.silent(duration=int(total_len * 1000), frame_rate=sr)
+
+    for seg in sorted(segments, key=lambda x: float(x.get("start", 0))):
+        sid = seg.get("id")
+        if sid is None or sid not in seg_audio_paths:
+            continue
+
+        try:
+            wav = AudioSegment.from_file(seg_audio_paths[sid]).set_frame_rate(sr).set_channels(1)
+            start_ms = int(float(seg.get("start", 0)) * 1000)
+
+            # Basit overlay
+            out = out.overlay(wav, position=start_ms)
+
+        except Exception as e:
+            logger.warning(f"Segment {sid} yerleştirilemedi: {e}")
+            continue
+
+    out.export(out_wav, format="wav")
+    return out_wav
+
 
 # ==================== Basit Lipsync (Wav2Lip) + Fallback Mux ======================
 def _apply_wav2lip(video_in: Path, audio_in: Path, wav2lip_repo: Optional[Path], checkpoint: Optional[Path], out_video: Path, face_det_batch: int = 16) -> Optional[Path]:
@@ -2263,14 +2431,16 @@ def process_video_wordwise(
             target_lang=tlang,
             workdir=out / "_work"
         )
-        dub_audio_wav, seg_audio_map = synthesize_dub_track_xtts(
+        dub_audio_wav, seg_audio_map = synthesize_dub_track_xtts_adaptive(
             segments=merged_segments,
             all_text=" ".join(merged_texts).strip(),
             voices_dir=voices_dir,
             latents_map=latents_map,
             target_lang=tlang,
             out_dir=out,
-            xtts_cfg=XTTSConfig(model_name=xtts_model_name, language=tlang, speed=xtts_speed)
+            xtts_cfg=XTTSConfig(model_name=xtts_model_name, language=tlang, speed=xtts_speed),
+            fit_to_segments=True,
+            adaptive_stretch=True  # ← YENİ PARAMETRE
         )
 
         # Ek güvenlik: video süresine göre kırp (pozitif offset korunur, sadece sondan kısaltır)

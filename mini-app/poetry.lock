@@ -4302,6 +4302,26 @@ files = [
 dev = ["build", "flake8", "mypy", "pytest", "twine"]
 
 [[package]]
+name = "pyrubberband"
+version = "0.4.0"
+description = "Python module to wrap rubberband"
+optional = false
+python-versions = ">=3.7"
+groups = ["main"]
+files = [
+    {file = "pyrubberband-0.4.0-py3-none-any.whl", hash = "sha256:0a803191f38debbbdfd9135939c1f75999e98511f19867d357b84e191f139ca9"},
+    {file = "pyrubberband-0.4.0.tar.gz", hash = "sha256:74707ec8ca6c6234e84ad2d9a4aa5c08a62fcfd83da011d535d41f4388ac49f7"},
+]
+
+[package.dependencies]
+numpy = ">=1.0"
+soundfile = ">=0.12.1"
+
+[package.extras]
+docs = ["numpydoc"]
+tests = ["pytest", "pytest-cov"]
+
+[[package]]
 name = "pysbd"
 version = "0.3.4"
 description = "pysbd (Python Sentence Boundary Disambiguation) is a rule-based sentence boundary detection that works out-of-the-box across many languages."
@@ -6550,4 +6570,4 @@ lipsync = ["numba", "opencv-python-headless", "tqdm"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "97caaddecf43e709b5e217a62ca8510773072db954a129366e59b9dcedfd0267"
+content-hash = "849724ec679c50fd3bda3c773e1a09fa13132c0b9b79ca52ed009f6e4d846dde"

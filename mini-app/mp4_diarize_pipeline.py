@@ -954,12 +954,20 @@ def _write_outputs(outdir: Path, stem: str, segments: List[dict], words: List[di
 
 
 # ============ NO-OVERLAP: Aynı konuşmacı segmentleri asla çakışmasın ============
-def enforce_no_overlap_same_speaker(segments: List[dict], margin: float = 0.02) -> Tuple[List[dict], Dict[str, int]]:
+def enforce_no_overlap_same_speaker(segments: List[dict], margin: float = 0.02, allow_overlap: bool = False) -> Tuple[List[dict], Dict[str, int]]:
     """
     Aynı konuşmacıya ait segmentler üst üste binmesin.
+    - allow_overlap=True ise hiçbir değişiklik yapma
     - Eğer seg.start < prev_end + margin ise, seg.start'ı prev_end + margin'e ileri al.
     - Negatif/çok kısa kalan segmentleri at.
     """
+    # Eğer overlap'e izin veriliyorsa, hiçbir değişiklik yapma
+    if allow_overlap:
+        dbg = debug_logger if 'debug_logger' in locals() else None
+        if dbg:
+            print("[NO_OVERLAP_ENFORCED] Segment overlap allowed - no trimming/dropping")
+        return segments, {"trimmed": 0, "dropped": 0, "allow_overlap": True}
+
     segs = sorted(copy.deepcopy(segments), key=lambda s: (float(s.get("start", 0.0)), float(s.get("end", 0.0))))
     by_spk: Dict[str, List[dict]] = defaultdict(list)
     for s in segs:
@@ -1382,8 +1390,8 @@ def _merge_segments(segments: List[dict], idx: int) -> bool:
 def rebalance_segments_for_tempo(
     segments: List[dict],
     tts_durations: Dict[int, float],
-    tempo_min: float = 0.75,
-    tempo_max: float = 1.25,
+    tempo_min: float = 0.2,
+    tempo_max: float = 5.0,
     max_passes: int = 2
 ) -> List[dict]:
     """
@@ -1993,8 +2001,8 @@ def synthesize_dub_track_xtts(
         xtts_cfg: Optional[XTTSConfig] = None,
         fit_to_segments: bool = True,
         use_tempo_limits: bool = True,
-        tempo_min: float = 0.75,
-        tempo_max: float = 1.25
+        tempo_min: float = 0.2,
+        tempo_max: float = 5.0
 ) -> Tuple[Path, Dict[int, Path]]:
     """
     Segment-based XTTS synthesis with duration matching.
@@ -2073,6 +2081,14 @@ def synthesize_dub_track_xtts(
         spk_wav = voices_dir / f"{spk}.wav"
         lat_path = latents_map.get(spk)
 
+        # Handle very short segments specially
+        if original_duration < 0.5 and len(text.strip()) < 10:
+            # For very short segments, add a pause or repeat to avoid TTS producing too long audio
+            logger.warning(f"Segment {sid} is very short ({original_duration:.2f}s) with text: {text}")
+            # Add ellipsis to encourage TTS to produce shorter output
+            if not text.strip().endswith((".", "!", "?", "...")):
+                text = text.strip() + "."
+
         # Generate TTS output
         raw_out = tmp_audio_dir / f"seg_{sid:06d}.raw.wav"
         if lat_path:
@@ -2084,6 +2100,16 @@ def synthesize_dub_track_xtts(
                     raise RuntimeError("Referans ses bulunamadı.")
                 spk_wav = fallback
             tts.synthesize(text, output_path=raw_out, speaker_wav=str(spk_wav), lang=target_lang)
+
+        # Check if TTS generated output
+        if not raw_out.exists():
+            logger.warning(f"TTS failed for segment {sid}, creating silent audio")
+            # Create silent audio with original duration
+            stretched = tmp_audio_dir / f"seg_{sid:06d}.fit.wav"
+            _run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=16000:cl=mono:d={original_duration}",
+                  "-ar", "16000", "-ac", "1", str(stretched)])
+            seg_audio[sid] = stretched
+            continue
 
         # Get TTS output duration
         tts_duration = _ffprobe_duration(raw_out)
@@ -2109,6 +2135,10 @@ def synthesize_dub_track_xtts(
             # Warn if tempo is outside preferred limits (even after rebalancing)
             if use_tempo_limits and (tempo < tempo_min or tempo > tempo_max):
                 logger.warning(f"Segment {sid} tempo {tempo:.2f} outside limits [{tempo_min}, {tempo_max}]")
+
+                # For extreme cases (tempo > 10), consider special handling
+                if tempo > 10:
+                    logger.error(f"Segment {sid}: Extreme tempo {tempo:.2f}x detected! Text may be too short for TTS.")
 
         else:
             # No time stretching, just normalize
@@ -2325,7 +2355,8 @@ def process_video_wordwise(
                     s["speaker"] = best_spk
 
 
-        merged_segments, noov_stats = enforce_no_overlap_same_speaker(merged_segments, margin=0.02)
+        # Overlap kontrolünü devre dışı bırak - boşlukları engellemek için
+        merged_segments, noov_stats = enforce_no_overlap_same_speaker(merged_segments, margin=0.02, allow_overlap=True)
         if debug:
             dbg.snap("NO_OVERLAP_ENFORCED", **noov_stats)
 
