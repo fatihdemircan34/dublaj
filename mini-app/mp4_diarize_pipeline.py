@@ -266,7 +266,7 @@ class SpeakerCandidate:
 
 class OptimizedSpeakerMapper:
     def __init__(self,
-                 min_overlap_ratio: float = 0.2,
+                 min_overlap_ratio: float = 0.5,
                  boundary_tolerance: float = 0.1,
                  min_segment_duration: float = 0.2,
                  use_vad_boundaries: bool = True,
@@ -674,26 +674,37 @@ def _chat_translate_batch(client: OpenAI,
     Geri dönüş: sadece çeviriler, satır-satır (ör: N satır).
     """
     numbered = "\n".join(f"{i+1}. {t or ''}" for i, (_, t) in enumerate(items))
-    sys_msg = f"Sen profesyonel bir çevirmen ve altyazı yerleştirme uzmanısın. SADECE çeviri metnini döndür. Ek yorum, açıklama, numara yazma."
+    sys_msg = f"You are a professional translator specializing in dubbing. Translate to natural spoken {tgt_lang}."
     if src_lang:
-        sys_msg += f" Kaynak dil: {src_lang}. "
-    sys_msg += f"Hedef dil: {tgt_lang}. Noktalama ve büyük/küçük harf korunmalı, zamanlama veya ID yazma."
-    user_msg = f"Aşağıdaki {len(items)} satırı sırayla çevir. Her satırı kendi satırında döndür (1:1). Metinler:\n{numbered}"
+        sys_msg += f" Source: {src_lang}."
+    user_msg = f"Translate each line below to {tgt_lang}. Keep the same number of lines. Be concise and natural:\n{numbered}"
     try:
         rsp = _safe_chat(client, model=model, system=sys_msg, user=user_msg)
+        if not rsp:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Empty translation response for batch of {len(items)} items")
+            return [""] * len(items)
+
         out = [ln.strip() for ln in rsp.split("\n") if ln.strip() != ""]
         # Eğer sayı/numara geldiyse temizle
         cleaned: List[str] = []
         for ln in out:
             # "1. ..." veya "1) ..." veya "1 -" gibi ön ekleri temizle
-            cleaned.append(ln.split(" ", 1)[1].strip() if ln[:2].isdigit() and " " in ln else ln.lstrip("0123456789).:- ").strip())
+            if ln and len(ln) > 2 and ln[0].isdigit() and " " in ln:
+                cleaned.append(ln.split(" ", 1)[1].strip())
+            else:
+                cleaned.append(ln.lstrip("0123456789).:- ").strip())
         # Satır sayısı uyuşmazsa alt/üst kırp
         if len(cleaned) < len(items):
             cleaned += [""] * (len(items)-len(cleaned))
         return cleaned[:len(items)]
     except Exception as e:
-        # Hata durumunda orijinal metni döndür (fail-open)
-        return [t for _, t in items]
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Translation batch failed: {e}")
+        # Return empty strings to trigger fallback
+        return [""] * len(items)
 
 def _safe_chat(client: OpenAI, *, model: str, system: str, user: str) -> str:
     # SDK değişikliklerine karşı sade kullanım
@@ -714,9 +725,38 @@ def translate_segments(segments: List[dict],
     Segment metinlerini hedef dile çevirir, orijinali `orig_text` alanına koyar.
     Boş veya çok kısa metinler atlanır.
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
     if not segments:
         return segments, {"translated": False}
-    client = _openai_client_or_raise()
+
+    # Google Translate kullanımını kontrol et
+    use_google = model == "google" or model == "google_cloud"
+
+    if use_google:
+        # Google Cloud Translate API kullan
+        try:
+            from google.cloud import translate_v2 as translate
+            import os
+            # Credentials kontrolü
+            if not os.getenv('GOOGLE_APPLICATION_CREDENTIALS'):
+                raise ValueError("GOOGLE_APPLICATION_CREDENTIALS not set")
+            translate_client = translate.Client()
+            logger.info("Using Google Cloud Translate API")
+        except ImportError:
+            logger.error("google-cloud-translate not installed. Run: poetry add google-cloud-translate")
+            logger.info("Falling back to OpenAI")
+            use_google = False
+            client = _openai_client_or_raise()
+        except Exception as e:
+            logger.error(f"Google Cloud Translate init failed: {e}")
+            logger.info("Falling back to OpenAI")
+            use_google = False
+            client = _openai_client_or_raise()
+    else:
+        client = _openai_client_or_raise()
+
     # Hazırla: sadece metni olanları al
     pending: List[Tuple[int, int, str]] = []  # (idx, seg_id, text)
     for i, seg in enumerate(segments):
@@ -731,16 +771,136 @@ def translate_segments(segments: List[dict],
     # Toplu çeviri
     total = len(pending)
     done = 0
-    for k in range(0, total, batch_size):
-        chunk = pending[k:k+batch_size]
-        pairs = [(sid, txt) for (_, sid, txt) in chunk]
-        translations = _chat_translate_batch(client, pairs, source_lang, target_lang, model=model)
-        for (i, _, _), tr in zip(chunk, translations):
-            orig = segments[i].get("text", "")
-            segments[i]["orig_text"] = orig
-            segments[i]["text"] = tr or orig  # boş dönerse orijinali koru
-        done += len(chunk)
-        if dbg: dbg.snap("TRANSLATE_BATCH", size=len(chunk), done=done, total=total)
+
+    if use_google:
+        # Google Translate ile çeviri
+        for k in range(0, total, batch_size):
+            chunk = pending[k:k+batch_size]
+            texts_to_translate = []
+
+            # Her segment için - ARTİK KISALTMA YOK, TAM METNİ ÇEVİR
+            for (idx, sid, txt) in chunk:
+                # İNGİLİZCE METNİ KISALTMA! TAM HALİYLE ÇEVİR
+                texts_to_translate.append(txt)
+
+            try:
+                # Google Translate batch çeviri
+                # Source language dönüşümü: 'english' -> 'en', 'turkish' -> 'tr' vb.
+                src_lang = source_lang or 'en'
+                if src_lang == 'english':
+                    src_lang = 'en'
+                elif src_lang == 'turkish':
+                    src_lang = 'tr'
+                elif src_lang == 'spanish':
+                    src_lang = 'es'
+                elif src_lang == 'french':
+                    src_lang = 'fr'
+                elif src_lang == 'german':
+                    src_lang = 'de'
+
+                results = translate_client.translate(
+                    texts_to_translate,
+                    source_language=src_lang,
+                    target_language=target_lang,
+                    format_='text'
+                )
+
+                for (i, _, _), result in zip(chunk, results):
+                    orig = segments[i].get("text", "")
+                    segments[i]["orig_text"] = orig
+                    tr = result.get('translatedText', '') if isinstance(result, dict) else ''
+
+                    # Artık prefix kullanmıyoruz, sadece HTML entities temizle
+                    tr = tr.replace('&#39;', "'")
+                    tr = tr.replace('&quot;', '"')
+                    tr = tr.replace('&amp;', '&')
+
+                    if not tr or tr.strip() == "":
+                        logger.warning(f"Translation failed for segment {i}: '{orig[:50]}...'")
+                        segments[i]["text"] = orig
+                        segments[i]["translation_failed"] = True
+                    else:
+                        # KELİME SAYISI ANALİZİ (GOOGLE TRANSLATE İÇİN)
+                        orig_words = len(orig.split())
+                        tr_words = len(tr.split())
+                        orig_chars = len(orig)
+                        tr_chars = len(tr)
+
+                        # Oran hesaplama
+                        word_ratio = tr_words / max(orig_words, 1)
+                        char_ratio = tr_chars / max(orig_chars, 1)
+
+                        # DETAYLI LOG
+                        logger.info(f"📊Segment {i} Translation Analysis:")
+                        logger.info(f"  EN: {orig_words} words, {orig_chars} chars")
+                        logger.info(f"  TR: {tr_words} words, {tr_chars} chars")
+                        logger.info(f"  Word ratio: {word_ratio:.2f}x ({'+' if word_ratio > 1 else ''}{(word_ratio-1)*100:.1f}%)")
+                        logger.info(f"  Char ratio: {char_ratio:.2f}x ({'+' if char_ratio > 1 else ''}{(char_ratio-1)*100:.1f}%)")
+
+                        if word_ratio > 1.3:
+                            logger.warning(f"  ⚠️ UZAMA: Türkçe %{(word_ratio-1)*100:.0f} daha uzun!")
+                        elif word_ratio < 0.7:
+                            logger.warning(f"  ✅ KISALMA: Türkçe %{(1-word_ratio)*100:.0f} daha kısa!")
+
+                        segments[i]["text"] = tr
+                        segments[i]["translation_failed"] = False
+                        segments[i]["orig_words"] = orig_words
+                        segments[i]["tr_words"] = tr_words
+                        segments[i]["word_ratio"] = word_ratio
+
+            except Exception as e:
+                logger.error(f"Google Translate batch failed: {e}")
+                # Hata durumunda orijinal metinleri koru
+                for (i, _, _) in chunk:
+                    orig = segments[i].get("text", "")
+                    segments[i]["orig_text"] = orig
+                    segments[i]["text"] = orig
+                    segments[i]["translation_failed"] = True
+
+            done += len(chunk)
+            if dbg: dbg.snap("TRANSLATE_BATCH", size=len(chunk), done=done, total=total, method="google")
+
+        # GOOGLE TRANSLATE BATCH SONRASI GENEL ANALİZ
+        if done == total:
+            total_orig_words = sum(s.get('orig_words', 0) for s in segments)
+            total_tr_words = sum(s.get('tr_words', 0) for s in segments)
+            if total_orig_words > 0:
+                overall_ratio = total_tr_words / total_orig_words
+                logger.info("\n" + "="*60)
+                logger.info("🌍 OVERALL TRANSLATION STATISTICS:")
+                logger.info(f"  Total EN words: {total_orig_words}")
+                logger.info(f"  Total TR words: {total_tr_words}")
+                logger.info(f"  Overall ratio: {overall_ratio:.2f}x")
+
+                # Anchor point adaylarını bul (ratio 0.8-1.2 arası)
+                anchor_candidates = []
+                for s in segments:
+                    if 0.8 <= s.get('word_ratio', 1.0) <= 1.2:
+                        anchor_candidates.append(s.get('id', -1))
+
+                logger.info(f"\n🎯 ANCHOR CANDIDATES (ratio 0.8-1.2): {len(anchor_candidates)} segments")
+                if anchor_candidates[:10]:  # İlk 10 adayı göster
+                    logger.info(f"  First 10: {anchor_candidates[:10]}")
+                logger.info("="*60 + "\n")
+    else:
+        # OpenAI ile çeviri (mevcut kod)
+        for k in range(0, total, batch_size):
+            chunk = pending[k:k+batch_size]
+            pairs = [(sid, txt) for (_, sid, txt) in chunk]
+            translations = _chat_translate_batch(client, pairs, source_lang, target_lang, model=model)
+            for (i, _, _), tr in zip(chunk, translations):
+                orig = segments[i].get("text", "")
+                segments[i]["orig_text"] = orig
+                # Çeviri boş veya None ise hata logla ve orijinali kullan
+                if not tr or tr.strip() == "":
+                    logger.warning(f"Translation failed for segment {i}: '{orig[:50]}...'")
+                    segments[i]["text"] = orig  # Keep original if translation fails
+                    segments[i]["translation_failed"] = True
+                else:
+                    segments[i]["text"] = tr
+                    segments[i]["translation_failed"] = False
+            done += len(chunk)
+            if dbg: dbg.snap("TRANSLATE_BATCH", size=len(chunk), done=done, total=total, method="openai")
 
     return segments, {"translated": True, "target_lang": target_lang, "model": model, "count": total}
 
@@ -954,7 +1114,7 @@ def _write_outputs(outdir: Path, stem: str, segments: List[dict], words: List[di
 
 
 # ============ NO-OVERLAP: Aynı konuşmacı segmentleri asla çakışmasın ============
-def enforce_no_overlap_same_speaker(segments: List[dict], margin: float = 0.02, allow_overlap: bool = False) -> Tuple[List[dict], Dict[str, int]]:
+def enforce_no_overlap_same_speaker(segments: List[dict], margin: float = 0.1, allow_overlap: bool = False) -> Tuple[List[dict], Dict[str, int]]:
     """
     Aynı konuşmacıya ait segmentler üst üste binmesin.
     - allow_overlap=True ise hiçbir değişiklik yapma
@@ -1300,33 +1460,149 @@ def _tempo_needed(tts_duration: float, target_duration: float) -> float:
     target_duration = max(1e-6, target_duration)
     return max(1e-6, tts_duration / target_duration)
 
-def _borrow_from_gaps(segments: List[dict], idx: int, need_extra: float) -> float:
+def merge_short_segments_same_speaker(segments: List[dict], min_duration: float = 1.0, max_gap: float = 0.5) -> List[dict]:
     """
-    Borrow time from neighboring gaps to extend target duration.
+    Aynı konuşmacının kısa segmentlerini birleştir.
+
+    Args:
+        segments: Segment listesi
+        min_duration: Minimum segment süresi (saniye)
+        max_gap: Birleştirme için maksimum boşluk (saniye)
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    if not segments:
+        return segments
+
+    merged = []
+    i = 0
+    merge_count = 0
+
+    while i < len(segments):
+        current = segments[i].copy()
+        current_duration = float(current.get("end", 0)) - float(current.get("start", 0))
+
+        # Kısa segment ise ve sonraki segmentlerle birleştirmeyi dene
+        if current_duration < min_duration and i + 1 < len(segments):
+            j = i + 1
+            accumulated_text = current.get("text", "")
+
+            # Aynı konuşmacının yakın segmentlerini birleştir
+            while j < len(segments):
+                next_seg = segments[j]
+                gap = float(next_seg.get("start", 0)) - float(current.get("end", 0))
+
+                # Aynı konuşmacı ve küçük boşluk varsa birleştir
+                if (current.get("speaker") == next_seg.get("speaker") and
+                    gap <= max_gap):
+
+                    # Metni birleştir
+                    accumulated_text = (accumulated_text.rstrip() + " " +
+                                      next_seg.get("text", "").lstrip()).strip()
+
+                    # Bitiş zamanını güncelle
+                    current["end"] = next_seg.get("end")
+                    current["text"] = accumulated_text
+
+                    # Yeni süreyi kontrol et
+                    new_duration = float(current["end"]) - float(current["start"])
+                    merge_count += 1
+
+                    # Yeterli uzunluğa ulaştıysa dur
+                    if new_duration >= min_duration:
+                        break
+
+                    j += 1
+                else:
+                    break
+
+            # Birleştirilmiş segmenti ekle
+            merged.append(current)
+            i = j + 1
+        else:
+            merged.append(current)
+            i += 1
+
+    if merge_count > 0:
+        logger.info(f"Merged {merge_count} short segments for better tempo control")
+
+    return merged
+
+def _borrow_from_gaps(segments: List[dict], idx: int, need_extra: float, max_range: int = 3) -> float:
+    """
+    Aggressively borrow time from neighboring segments (up to max_range segments away).
     Returns amount of time gained.
     """
-    gained = 0.0
+    import logging
+    logger = logging.getLogger(__name__)
 
-    # Try borrowing from next gap first
+    gained = 0.0
+    current = segments[idx]
+    current_speaker = current.get("speaker")
+
+    # Phase 1: Try borrowing from immediate gaps
     if idx < len(segments) - 1:
         gap = _seg_gap(segments[idx], segments[idx + 1])
         if gap > 0:
-            # Leave at least 20ms gap for safety
-            take = min(gap - 0.02, need_extra)
+            # Leave minimal gap for aggressive borrowing
+            take = min(gap - 0.01, need_extra)
             if take > 0:
                 segments[idx]["end"] = float(segments[idx]["end"]) + take
                 segments[idx + 1]["start"] = float(segments[idx + 1]["start"]) + take
                 gained += take
                 need_extra -= take
 
-    # If still need more, try borrowing from previous gap
     if need_extra > 1e-6 and idx > 0:
         gap = _seg_gap(segments[idx - 1], segments[idx])
         if gap > 0:
-            take = min(gap - 0.02, need_extra)
+            take = min(gap - 0.01, need_extra)
             if take > 0:
                 segments[idx - 1]["end"] = float(segments[idx - 1]["end"]) + take
                 gained += take
+                need_extra -= take
+
+    # Phase 2: Aggressive borrowing from same speaker's nearby segments
+    if need_extra > 1e-6:
+        # Look at neighbors within max_range
+        for distance in range(1, max_range + 1):
+            if need_extra <= 1e-6:
+                break
+
+            # Check forward neighbors
+            if idx + distance < len(segments):
+                neighbor = segments[idx + distance]
+                if neighbor.get("speaker") == current_speaker:
+                    neighbor_duration = _seg_duration(neighbor)
+                    # Can compress neighbor to 1.1x speed (saving ~9% of its duration)
+                    if neighbor_duration > 1.0:
+                        spare_time = neighbor_duration * 0.08  # Conservative: 8% compression
+                        take = min(need_extra, spare_time)
+                        if take > 0:
+                            # Shorten neighbor
+                            neighbor["end"] = float(neighbor["end"]) - take
+                            gained += take
+                            need_extra -= take
+                            logger.debug(f"Borrowed {take:.3f}s from segment {idx+distance}")
+
+            # Check backward neighbors
+            if need_extra > 1e-6 and idx - distance >= 0:
+                neighbor = segments[idx - distance]
+                if neighbor.get("speaker") == current_speaker:
+                    neighbor_duration = _seg_duration(neighbor)
+                    # Can compress neighbor to 1.1x speed
+                    if neighbor_duration > 1.0:
+                        spare_time = neighbor_duration * 0.08
+                        take = min(need_extra, spare_time)
+                        if take > 0:
+                            # Move neighbor start later (giving us space before)
+                            neighbor["start"] = float(neighbor["start"]) + take
+                            gained += take
+                            need_extra -= take
+                            logger.debug(f"Borrowed {take:.3f}s from segment {idx-distance}")
+
+    if gained > 0:
+        logger.info(f"Segment {idx}: Borrowed total {gained:.3f}s from neighbors")
 
     return gained
 
@@ -1390,8 +1666,8 @@ def _merge_segments(segments: List[dict], idx: int) -> bool:
 def rebalance_segments_for_tempo(
     segments: List[dict],
     tts_durations: Dict[int, float],
-    tempo_min: float = 0.2,
-    tempo_max: float = 5.0,
+    tempo_min: float = 0.5,
+    tempo_max: float = 2.0,
     max_passes: int = 2
 ) -> List[dict]:
     """
@@ -1438,8 +1714,8 @@ def rebalance_segments_for_tempo(
                 min_target = tts_duration / tempo_max
                 need_extra = max(0.0, min_target - target_duration)
 
-                # Try borrowing from gaps
-                gained = _borrow_from_gaps(segments, i, need_extra)
+                # Try aggressive borrowing from gaps and neighbors
+                gained = _borrow_from_gaps(segments, i, need_extra, max_range=3)
 
                 # If not enough, try merging with neighbor
                 if gained + 1e-6 < need_extra:
@@ -1650,7 +1926,7 @@ def _load_xtts_engine(model_name: str, language: str):
 class XTTSConfig:
     model_name: str = "tts_models/multilingual/multi-dataset/xtts_v2"
     language: str = "tr"
-    speed: Optional[float] = None  # None -> otomatik süre esnetme
+    speed: Optional[float] = 1.3  # Varsayılan daha hızlı konuşma
 
 def _ensure_pydub():
     if AudioSegment is None:
@@ -1990,6 +2266,186 @@ def build_reference_voices(original_audio: Path,
 
     return voices_dir, latents_map
 
+# ==================== Anchor-Based Segmentation Algorithm =============
+def create_anchor_based_segments(
+    segments: List[dict],
+    diar_segments: List[dict],
+    anchors: List[Tuple[float, float]] = None
+) -> List[dict]:
+    """
+    Anchor-Diarization birleştirme algoritması
+    B = S ∪ {O_i} - Konuşmacı sınırları + Anchor noktaları
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    if not segments:
+        return segments
+
+    # Eğer anchor yoksa, otomatik anchor oluştur
+    if not anchors:
+        total_duration = max(s.get('end', 0) for s in segments) if segments else 0
+        anchors = [(0.0, 0.0), (total_duration, total_duration)]
+
+        # Word ratio'ya göre iyi segmentleri anchor yap (0.8-1.2 arası)
+        good_segments = [s for s in segments if 0.8 <= s.get('word_ratio', 1.0) <= 1.2]
+
+        # Her 10 saniyede bir anchor ekle (daha sık)
+        for t in range(10, int(total_duration), 10):
+            closest = min(good_segments, key=lambda s: abs(s['start'] - t), default=None) if good_segments else None
+            if closest:
+                orig_time = closest['start']
+                # Word ratio'ya göre tahmini dublaj zamanı
+                dub_time = orig_time * closest.get('word_ratio', 1.0)
+                anchors.append((orig_time, dub_time))
+
+        anchors = sorted(set(anchors))
+        logger.info(f"🎯 Auto-generated {len(anchors)} anchor points")
+
+    # Konuşmacı sınırlarını al
+    speaker_bounds = []
+
+    # Tek/çok konuşmacı kontrolü
+    unique_speakers = set(d.get('speaker') for d in diar_segments) if diar_segments else set()
+
+    if len(unique_speakers) <= 1:
+        # TEK KONUşMACI - sadece anchor'lar kullan
+        logger.info("👤 Single speaker detected - using only anchor points")
+        B = sorted([O for O, _ in anchors])
+    else:
+        # ÇOK KONUşMACI - diarization sınırları ekle
+        for i in range(len(diar_segments) - 1):
+            if diar_segments[i].get('speaker') != diar_segments[i + 1].get('speaker'):
+                speaker_bounds.append(diar_segments[i].get('end'))
+
+        # B = S ∪ {O_i}
+        B = sorted(set(speaker_bounds + [O for O, _ in anchors]))
+        logger.info(f"👥 Multi-speaker: {len(speaker_bounds)} boundaries + {len(anchors)} anchors = {len(B)} points")
+
+    # Piecewise linear mapping: f(t)
+    def f(t: float) -> float:
+        for i in range(len(anchors) - 1):
+            O_i, D_i = anchors[i]
+            O_next, D_next = anchors[i + 1]
+            if O_i <= t <= O_next:
+                if O_next - O_i > 0:
+                    alpha = (D_next - D_i) / (O_next - O_i)
+                    return D_i + alpha * (t - O_i)
+                return D_i
+        # Extrapolation
+        if t > anchors[-1][0] and len(anchors) > 1:
+            O_last, D_last = anchors[-1]
+            O_prev, D_prev = anchors[-2]
+            if O_last - O_prev > 0:
+                alpha = (D_last - D_prev) / (O_last - O_prev)
+                return D_last + alpha * (t - O_last)
+        return t
+
+    # Yeni segmentler
+    new_segments = []
+    for k in range(len(B) - 1):
+        start_orig, end_orig = B[k], B[k + 1]
+
+        # Min segment süresi (0.5s) ve Max segment süresi (10s)
+        segment_duration = end_orig - start_orig
+        if segment_duration < 0.5:
+            continue
+
+        # Eğer segment çok uzunsa (>10s), parçala
+        if segment_duration > 10.0:
+            # 10 saniyelik parçalara böl
+            num_parts = int(segment_duration / 8.0) + 1
+            part_duration = segment_duration / num_parts
+
+            for part in range(num_parts):
+                part_start_orig = start_orig + part * part_duration
+                part_end_orig = min(start_orig + (part + 1) * part_duration, end_orig)
+
+                # Dublaj mapping
+                part_start_dub = f(part_start_orig)
+                part_end_dub = f(part_end_orig)
+
+                # Tempo hesapla
+                part_orig_duration = part_end_orig - part_start_orig
+                part_dub_duration = part_end_dub - part_start_dub
+                part_tempo_ratio = part_dub_duration / part_orig_duration if part_orig_duration > 0 else 1.0
+
+                # Konuşmacı bul
+                speaker = 'UNKNOWN'
+                if diar_segments:
+                    for d in diar_segments:
+                        if d['start'] <= part_start_orig < d['end']:
+                            speaker = d.get('speaker', 'UNKNOWN')
+                            break
+
+                # Metni birleştir
+                text = ""
+                for s in segments:
+                    overlap = min(part_end_orig, s.get('end', 0)) - max(part_start_orig, s.get('start', 0))
+                    if overlap > 0:
+                        text += s.get('text', '') + " "
+
+                new_segments.append({
+                    'id': len(new_segments),
+                    'start': part_start_orig,
+                    'end': part_end_orig,
+                    'start_dub': part_start_dub,
+                    'end_dub': part_end_dub,
+                    'tempo_ratio': part_tempo_ratio,
+                    'speaker': speaker,
+                    'text': text.strip(),
+                    'duration': part_orig_duration
+                })
+            continue  # Uzun segment işlendi, sonrakine geç
+
+        # Dublaj mapping
+        start_dub = f(start_orig)
+        end_dub = f(end_orig)
+
+        # Tempo hesapla: r_k = (f(b_{k+1}) - f(b_k)) / (b_{k+1} - b_k)
+        orig_duration = end_orig - start_orig
+        dub_duration = end_dub - start_dub
+        tempo_ratio = dub_duration / orig_duration if orig_duration > 0 else 1.0
+
+        # Konuşmacı bul
+        speaker = 'UNKNOWN'
+        if diar_segments:
+            for d in diar_segments:
+                if d['start'] <= start_orig < d['end']:
+                    speaker = d.get('speaker', 'UNKNOWN')
+                    break
+
+        # Metni birleştir
+        text = ""
+        for s in segments:
+            overlap = min(end_orig, s.get('end', 0)) - max(start_orig, s.get('start', 0))
+            if overlap > 0:
+                text += s.get('text', '') + " "
+
+        new_segments.append({
+            'id': k,
+            'start': start_orig,
+            'end': end_orig,
+            'start_dub': start_dub,
+            'end_dub': end_dub,
+            'tempo_ratio': tempo_ratio,
+            'speaker': speaker,
+            'text': text.strip(),
+            'duration': orig_duration
+        })
+
+    # Tempo istatistikleri
+    if new_segments:
+        tempos = [s['tempo_ratio'] for s in new_segments]
+        avg_tempo = sum(tempos) / len(tempos)
+        logger.info(f"⚛️ Tempo stats: avg={avg_tempo:.2f}, min={min(tempos):.2f}, max={max(tempos):.2f}")
+
+        extreme = sum(1 for t in tempos if t < 0.5 or t > 2.0)
+        if extreme > 0:
+            logger.warning(f"⚠️ {extreme}/{len(tempos)} segments need extreme tempo!")
+
+    return new_segments
+
 # ==================== Segment Bazlı XTTS -> Süre Uydurma -> Birleştirme =============
 def synthesize_dub_track_xtts(
         segments: List[dict],
@@ -1999,10 +2455,11 @@ def synthesize_dub_track_xtts(
         target_lang: str,
         out_dir: Path,
         xtts_cfg: Optional[XTTSConfig] = None,
-        fit_to_segments: bool = True,
+        fit_to_segments: bool = False,  # TIME STRETCHING KAPALI
         use_tempo_limits: bool = True,
-        tempo_min: float = 0.2,
-        tempo_max: float = 5.0
+        aggressive_rebalance: bool = True,
+        tempo_min: float = 0.5,
+        tempo_max: float = 2.0
 ) -> Tuple[Path, Dict[int, Path]]:
     """
     Segment-based XTTS synthesis with duration matching.
@@ -2025,6 +2482,10 @@ def synthesize_dub_track_xtts(
     if use_tempo_limits and fit_to_segments:
         logger.info("Estimating TTS durations for tempo rebalancing...")
 
+        # First, merge very short segments from same speaker
+        if aggressive_rebalance:
+            segments = merge_short_segments_same_speaker(segments, min_duration=1.0, max_gap=0.5)
+
         # Phase 1: Estimate TTS durations for all segments
         tts_durations = {}
         for seg in segments:
@@ -2037,14 +2498,14 @@ def synthesize_dub_track_xtts(
                 estimated_duration = estimate_tts_duration(text, target_lang)
                 tts_durations[sid] = estimated_duration
 
-        # Phase 2: Rebalance segments to stay within tempo limits
-        logger.info(f"Rebalancing segments for tempo limits [{tempo_min}, {tempo_max}]...")
+        # Phase 2: Aggressively rebalance segments to stay within tempo limits
+        logger.info(f"Aggressively rebalancing segments for tempo limits [{tempo_min}, {tempo_max}]...")
         segments = rebalance_segments_for_tempo(
             segments=segments,
             tts_durations=tts_durations,
             tempo_min=tempo_min,
             tempo_max=tempo_max,
-            max_passes=5  # More passes for better optimization
+            max_passes=10  # More passes for aggressive optimization
         )
         logger.info(f"Rebalancing complete. {len(segments)} segments remain.")
 
@@ -2053,6 +2514,7 @@ def synthesize_dub_track_xtts(
         "total_original": 0.0,
         "total_tts": 0.0,
         "total_stretched": 0.0,
+        "total_tts_natural": 0.0,  # Time stretching olmadan doğal TTS süresi
         "max_drift": 0.0,
         "segments_processed": 0,
         "tempos": []
@@ -2089,21 +2551,88 @@ def synthesize_dub_track_xtts(
             if not text.strip().endswith((".", "!", "?", "...")):
                 text = text.strip() + "."
 
-        # Generate TTS output
+        # Handle XTTS 400 token limit and check if segment needs splitting
+        max_chars = 200  # Daha güvenli limit (226 yerine 200)
+
+        # AGRESİF KARAKTER LİMİTİ: Süreye göre dinamik limit
+        # Her saniye için yaklaşık 15-20 karakter (Türkçe için)
+        dynamic_char_limit = int(original_duration * 20)  # 20 karakter/saniye
+
+        # Daha kısıtı limiti kullan
+        effective_limit = min(max_chars, dynamic_char_limit)
+
+        # Eğer metin limiti aşıyorsa, kısalt
+        if len(text) > effective_limit:
+            logger.warning(f"Segment {sid} too long ({original_duration:.1f}s, {len(text)} chars), limit: {effective_limit} chars, will truncate")
+
+            # Metni cümlelere böl
+            sentences = []
+            temp_text = text
+            for sep in ['. ', '! ', '? ']:
+                parts = temp_text.split(sep)
+                if len(parts) > 1:
+                    sentences = [p + sep.strip() for p in parts[:-1]] + [parts[-1]]
+                    break
+            if not sentences:
+                # Virgülle böl
+                sentences = text.split(', ')
+                sentences = [s + ',' if i < len(sentences)-1 else s for i, s in enumerate(sentences)]
+
+            # En uygun cümle kombinasyonunu bul
+            selected_text = ""
+            for i, sent in enumerate(sentences):
+                if len(selected_text + sent) <= effective_limit:
+                    selected_text += sent if i == 0 else " " + sent
+                else:
+                    break
+
+            if not selected_text:  # Hiçbir cümle sığmadıysa ilk cümleyi kısalt
+                selected_text = sentences[0][:effective_limit]
+
+            text = selected_text.strip()
+            if not text.endswith(('.',  '!', '?')):
+                text = text + '.'
+            logger.info(f"Segment {sid} truncated: {len(text)} chars (limit was {effective_limit})")
+
+        elif len(text) > effective_limit:
+            # Normal truncate with dynamic limit
+            logger.warning(f"Segment {sid} text too long ({len(text)} chars), truncating to {effective_limit}")
+            truncated = text[:effective_limit]
+            # Find last sentence ending
+            for sep in ['. ', '! ', '? ', ', ']:
+                idx = truncated.rfind(sep)
+                if idx > effective_limit * 0.7:  # At least 70% of effective length
+                    text = truncated[:idx + 1]
+                    break
+            else:
+                # No good boundary found, just truncate and add ellipsis
+                text = truncated.strip() + '...'
+
+        # Generate TTS output with error handling
         raw_out = tmp_audio_dir / f"seg_{sid:06d}.raw.wav"
-        if lat_path:
-            tts.synthesize(text, output_path=raw_out, latents_path=lat_path, lang=target_lang)
-        else:
-            if not spk_wav.exists():
-                fallback = next(iter(voices_dir.glob("*.wav")), None)
-                if fallback is None:
-                    raise RuntimeError("Referans ses bulunamadı.")
-                spk_wav = fallback
-            tts.synthesize(text, output_path=raw_out, speaker_wav=str(spk_wav), lang=target_lang)
+        try:
+            if lat_path:
+                tts.synthesize(text, output_path=raw_out, latents_path=lat_path, lang=target_lang)
+            else:
+                if not spk_wav.exists():
+                    fallback = next(iter(voices_dir.glob("*.wav")), None)
+                    if fallback is None:
+                        raise RuntimeError("Referans ses bulunamadı.")
+                    spk_wav = fallback
+                tts.synthesize(text, output_path=raw_out, speaker_wav=str(spk_wav), lang=target_lang)
+        except Exception as e:
+            logger.error(f"TTS failed for segment {sid}: {e}")
+            logger.error(f"Text length: {len(text)} chars, text: {text[:100]}...")
+            # Create silent audio as fallback directly to stretched file
+            stretched = tmp_audio_dir / f"seg_{sid:06d}.fit.wav"
+            _run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=16000:cl=mono:d={original_duration}",
+                  "-ar", "16000", "-ac", "1", str(stretched)])
+            seg_audio[sid] = stretched
+            continue
 
         # Check if TTS generated output
         if not raw_out.exists():
-            logger.warning(f"TTS failed for segment {sid}, creating silent audio")
+            logger.warning(f"TTS output not found for segment {sid}, creating silent audio")
             # Create silent audio with original duration
             stretched = tmp_audio_dir / f"seg_{sid:06d}.fit.wav"
             _run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=16000:cl=mono:d={original_duration}",
@@ -2112,48 +2641,48 @@ def synthesize_dub_track_xtts(
             continue
 
         # Get TTS output duration
-        tts_duration = _ffprobe_duration(raw_out)
+        try:
+            tts_duration = _ffprobe_duration(raw_out)
+        except Exception as e:
+            logger.error(f"Failed to get duration for segment {sid}: {e}")
+            # Create silent audio as fallback
+            stretched = tmp_audio_dir / f"seg_{sid:06d}.fit.wav"
+            _run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=16000:cl=mono:d={original_duration}",
+                  "-ar", "16000", "-ac", "1", str(stretched)])
+            seg_audio[sid] = stretched
+            continue
         duration_stats["total_tts"] += tts_duration
 
-        # Apply time stretching to match original duration
-        stretched = tmp_audio_dir / f"seg_{sid:06d}.fit.wav"
+        # TIME STRETCHING KAPALI - Direkt raw TTS çıktısını kullan
+        # Artık .fit.wav üretmiyor, ses hızlandırma/yavaşlatma yok
+        final_wav = tmp_audio_dir / f"seg_{sid:06d}.final.wav"
 
-        if fit_to_segments:
-            # ALWAYS match original duration exactly to prevent drift
-            target_duration = original_duration
-
-            # Apply time stretching
-            _time_stretch_to_duration(raw_out, target_sec=target_duration, out_wav=stretched, enable=True)
-
-            # Log significant adjustments
-            tempo = tts_duration / target_duration
-            duration_stats["tempos"].append(tempo)
-
-            if abs(tempo - 1.0) > 0.1:  # More than 10% adjustment
-                logger.info(f"Segment {sid} ({spk}): TTS {tts_duration:.2f}s -> Target {target_duration:.2f}s (tempo: {tempo:.2f})")
-
-            # Warn if tempo is outside preferred limits (even after rebalancing)
-            if use_tempo_limits and (tempo < tempo_min or tempo > tempo_max):
-                logger.warning(f"Segment {sid} tempo {tempo:.2f} outside limits [{tempo_min}, {tempo_max}]")
-
-                # For extreme cases (tempo > 10), consider special handling
-                if tempo > 10:
-                    logger.error(f"Segment {sid}: Extreme tempo {tempo:.2f}x detected! Text may be too short for TTS.")
-
+        # Raw TTS çıktısını direkt kullan (hızlandırma yok)
+        if raw_out.exists():
+            # Sadece format dönüşümü yap (hız değiştirme yok)
+            _run(["ffmpeg", "-y", "-i", str(raw_out),
+                  "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+                  str(final_wav)])
         else:
-            # No time stretching, just normalize
-            _time_stretch_to_duration(raw_out, target_sec=0.0, out_wav=stretched, enable=False)
+            # TTS başarısızsa sessiz ses oluştur
+            _run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"anullsrc=r=16000:cl=mono:d={original_duration}",
+                  "-ar", "16000", "-ac", "1", str(final_wav)])
 
-        # Verify stretched duration
-        final_duration = _ffprobe_duration(stretched)
-        duration_stats["total_stretched"] += final_duration
+        # Süre bilgisi (sadece log için)
+        final_duration = _ffprobe_duration(final_wav)
+        natural_tempo = tts_duration / original_duration if original_duration > 0 else 1.0
+
+        if abs(natural_tempo - 1.0) > 0.3:  # %30'dan fazla fark varsa uyar
+            logger.info(f"Segment {sid}: Natural duration mismatch - TTS: {tts_duration:.2f}s, Original: {original_duration:.2f}s (ratio: {natural_tempo:.2f}x)")
+            logger.info(f"  → Using natural TTS duration without speed adjustment")
+        duration_stats["total_tts_natural"] += final_duration  # Stretching olmadığı için 'natural'
 
         # Track maximum drift
         drift = abs(final_duration - original_duration)
         if drift > duration_stats["max_drift"]:
             duration_stats["max_drift"] = drift
 
-        seg_audio[sid] = stretched
+        seg_audio[sid] = final_wav
         duration_stats["segments_processed"] += 1
 
     # Log duration statistics
@@ -2161,9 +2690,9 @@ def synthesize_dub_track_xtts(
         logger.info(f"Duration Statistics:")
         logger.info(f"  Total Original: {duration_stats['total_original']:.2f}s")
         logger.info(f"  Total TTS: {duration_stats['total_tts']:.2f}s")
-        logger.info(f"  Total Stretched: {duration_stats['total_stretched']:.2f}s")
+        logger.info(f"  Total TTS Natural: {duration_stats.get('total_tts_natural', duration_stats.get('total_stretched', 0)):.2f}s")
         logger.info(f"  Max Single Drift: {duration_stats['max_drift']:.2f}s")
-        logger.info(f"  Overall Drift: {abs(duration_stats['total_stretched'] - duration_stats['total_original']):.2f}s")
+        logger.info(f"  Natural Difference: {abs(duration_stats.get('total_tts_natural', duration_stats.get('total_stretched', 0)) - duration_stats['total_original']):.2f}s")
 
         # Log tempo statistics
         if duration_stats["tempos"]:
@@ -2240,7 +2769,7 @@ def process_video_wordwise(
         target_lang: Optional[str] = None,
         xtts_model_name: str = "tts_models/multilingual/multi-dataset/xtts_v2",
         xtts_speed: Optional[float] = None,
-        fit_to_segments: bool = True,
+        fit_to_segments: bool = False,  # TIME STRETCHING KAPALI
         do_lipsync: bool = True,
         wav2lip_repo: Optional[str] = None,
         wav2lip_checkpoint: Optional[str] = None,
@@ -2408,14 +2937,25 @@ def process_video_wordwise(
     lipsync_used  = False
 
     if do_dub:
+        # ANCHOR-BASED SEGMENTATION UYGULA
+        anchor_segments = create_anchor_based_segments(
+            segments=merged_segments,
+            diar_segments=diar_segments if diar_segments else [],
+            anchors=None  # Otomatik anchor oluştur
+        )
+
+        # Anchor segmentleri kullan (eğer oluşturulduysa)
+        segments_to_use = anchor_segments if anchor_segments else merged_segments
+        logger.info(f"Using {'anchor-based' if anchor_segments else 'original'} segments for dubbing")
+
         voices_dir, latents_map = build_reference_voices(
             original_audio=wav_for_diar,
-            segments=merged_segments,
+            segments=segments_to_use,
             target_lang=tlang,
             workdir=out / "_work"
         )
         dub_audio_wav, seg_audio_map = synthesize_dub_track_xtts(
-            segments=merged_segments,
+            segments=segments_to_use,
             all_text=" ".join(merged_texts).strip(),
             voices_dir=voices_dir,
             latents_map=latents_map,
@@ -2550,19 +3090,19 @@ if __name__ == "__main__":
         debug=True,
         # Mapping
         use_optimized_mapping=True,
-        min_overlap_ratio=0.2,
-        boundary_tolerance=0.1,
+        min_overlap_ratio=0.5,  # Artırıldı: en az %50 örtüşme gerekli
+        boundary_tolerance=0.3,  # Artırıldı: daha esnek sınır toleransı
         use_vad_boundaries=True,
         use_timeline=True,
-        confidence_threshold=0.6,
+        confidence_threshold=0.7,  # Artırıldı: daha yüksek güven eşiği
         # ÇEVİRİ
         do_translate=True,                 # <—— ÇEVİRİ ETKİN
-        translator_model="gpt-4o",    # (istersen gpt-4o)
+        translator_model="google",    # Google Cloud Translate API kullan
         # DUB + LIPSYNC
         do_dub=True,
         target_lang="tr",  # hedef dil
         xtts_model_name="tts_models/multilingual/multi-dataset/xtts_v2",
-        xtts_speed=None,   # None -> segment süresine otomatik esnetme
+        xtts_speed=1.3,   # Daha hızlı konuşma (1.3x)
         do_lipsync=True,
         wav2lip_repo=None,        # örn: "/opt/Wav2Lip"
         wav2lip_checkpoint=None,  # örn: "/opt/Wav2Lip/checkpoints/Wav2Lip.pth"
