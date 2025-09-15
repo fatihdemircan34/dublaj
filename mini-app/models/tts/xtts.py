@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 import inspect
 import logging
 
@@ -166,18 +166,103 @@ class XTTSEngine(BaseTTSEngine):
         return output_path
 
     def _synth_with_latents(self, text: str, lang: str, lat: Dict[str, torch.Tensor]):
+        """
+        XTTS inference çıktısını (Tensor/ndarray/dict/tuple/list) güvenle normalize eder.
+        DÖNÜŞ: (torch.FloatTensor [1, T] CPU), sample_rate:int
+        """
+        import numpy as np
+
         mdl = self._tts.synthesizer.tts_model
-        inf_kwargs = {
-            "text": text,
-            "language": lang,
-            "gpt_cond_latent": lat["gpt"],
-            "speaker_embedding": lat["spk"],
-        }
-        if "diff" in lat:
-            inf_kwargs["diffusion_conditioning"] = lat["diff"]
-        wav = mdl.inference(**inf_kwargs)
-        if not isinstance(wav, torch.Tensor):
-            wav = torch.tensor(wav)
-        if wav.dim() == 1:
-            wav = wav.unsqueeze(0)
-        return wav.to(torch.float32), 24000
+
+        # Model cihazını al; latents'ı oraya taşı
+        try:
+            device = next(mdl.parameters()).device
+        except Exception:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        def _to_device(x):
+            if x is None:
+                return None
+            if isinstance(x, torch.Tensor):
+                return x.to(device)
+            if isinstance(x, np.ndarray):
+                return torch.from_numpy(x).to(device)
+            return x
+
+        gpt  = _to_device(lat.get("gpt"))
+        spk  = _to_device(lat.get("spk"))
+        diff = _to_device(lat.get("diff")) if lat.get("diff", None) is not None else None
+
+        out = mdl.inference(
+            text=text,
+            language=lang,
+            gpt_cond_latent=gpt,
+            diffusion_conditioning=diff,
+            speaker_embedding=spk,
+        )
+
+        # --- Çıktıyı (wav_t [1,T], sr) haline getir ---
+        sr = 24000  # XTTS v2 default
+        wav_t: Optional[torch.Tensor] = None
+
+        if isinstance(out, torch.Tensor):
+            wav_t = out.detach()
+
+        elif isinstance(out, np.ndarray):
+            wav_t = torch.from_numpy(out)
+
+        elif isinstance(out, dict):
+            cand = out.get("audio", None)
+            if cand is None:
+                cand = out.get("wav", None)
+            if cand is None:
+                cand = out.get("waveform", None)
+
+            if isinstance(cand, torch.Tensor):
+                wav_t = cand.detach()
+            elif isinstance(cand, np.ndarray):
+                wav_t = torch.from_numpy(cand)
+            else:
+                # list/tuple vb. ise numpy'a zorla
+                wav_t = torch.as_tensor(np.asarray(cand, dtype=np.float32))
+
+            # SR alanı varsa kullan
+            try:
+                sr = int(out.get("sample_rate", out.get("sr", sr)))
+            except Exception:
+                pass
+
+        elif isinstance(out, (list, tuple)):
+            # İlk dönüştürülebilir öğeyi seç
+            for item in out:
+                if isinstance(item, torch.Tensor):
+                    wav_t = item.detach(); break
+                if isinstance(item, np.ndarray):
+                    wav_t = torch.from_numpy(item); break
+                try:
+                    wav_t = torch.as_tensor(np.asarray(item, dtype=np.float32)); break
+                except Exception:
+                    continue
+            if wav_t is None:
+                raise RuntimeError(f"Unsupported list/tuple elements from XTTS: {[type(i) for i in out]}")
+
+        else:
+            wav_t = torch.as_tensor(np.asarray(out, dtype=np.float32))
+
+        # Şekli normalize et: (T,), (1,T), (T,1), (C,T) → (1, T)
+        if wav_t.dim() == 1:
+            wav_t = wav_t.unsqueeze(0)  # (1, T)
+        elif wav_t.dim() == 2:
+            if wav_t.shape[0] == 1:
+                pass  # (1, T)
+            elif wav_t.shape[1] == 1:
+                wav_t = wav_t[:, 0].unsqueeze(0)  # (T,1) → (1, T)
+            else:
+                wav_t = wav_t[:1, :]  # (C, T) → ilk kanal
+        else:
+            wav_t = wav_t.flatten().unsqueeze(0)
+
+        # CPU/float32'ye getir
+        wav_t = wav_t.to(dtype=torch.float32, device="cpu")
+
+        return wav_t, int(sr)

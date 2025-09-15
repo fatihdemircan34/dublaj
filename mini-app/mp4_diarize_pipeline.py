@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional, Tuple, Set, Iterable
@@ -6,6 +7,13 @@ import copy
 from collections import defaultdict, Counter
 import warnings
 warnings.filterwarnings('ignore')
+
+# Import speaker analyzer and Demucs components
+from speaker_segment_analyzer import (
+    SpeakerSegmentAnalyzer,
+    DemucsVocalSeparator,
+    DubbingMixer
+)
 
 # ===== Std & IO =====
 from pathlib import Path
@@ -18,6 +26,10 @@ import time
 import shutil
 import subprocess
 import requests
+import logging
+
+# Cache for FFmpeg filter availability
+_FFMPEG_HAS_RUBBERBAND = None
 
 # ===== 3rd-party =====
 try:
@@ -38,8 +50,132 @@ try:
 except Exception:
     AudioSegment = None
 
-# ====================== Timeline / Diar Utils (mevcut kodun) ======================
+# ================== LOGGING ==================
+logger = logging.getLogger("miniapp")
+logger.setLevel(logging.INFO)
 
+# ================== XTTS LATENTS PATCH ==================
+import torch
+
+logger_xtts = logging.getLogger("miniapp.xtts")
+logger_xtts.setLevel(logging.INFO)
+
+@dataclass
+class XttsConfig:
+    tts: str = "xtts"
+    sample_rate: int = 22050
+    temperature: float = 0.7
+
+def _safe_mkdir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+def _save_tensor(t: torch.Tensor, path: str) -> None:
+    _safe_mkdir(os.path.dirname(path))
+    torch.save(t.detach().cpu(), path)
+
+def get_conditioning_latents_safe(model, ref_wav_path: str):
+    try:
+        latents = model.get_conditioning_latents(audio_path=[ref_wav_path])
+    except TypeError:
+        try:
+            latents = model.get_conditioning_latents([ref_wav_path])
+        except Exception as e:
+            raise RuntimeError(f"XTTS latents çağrısı başarısız: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"XTTS latents çağrısı başarısız: {e}") from e
+
+    if not isinstance(latents, tuple):
+        raise RuntimeError(f"Beklenmeyen dönüş tipi: {type(latents)}")
+    if len(latents) == 3:
+        gpt, diff, spk = latents
+        return {"gpt": gpt, "diff": diff, "spk": spk}
+    elif len(latents) == 2:
+        gpt, spk = latents
+        return {"gpt": gpt, "diff": None, "spk": spk}
+    else:
+        raise RuntimeError(f"Beklenmeyen latent sayısı: {len(latents)}")
+
+def build_ref_voice_latents(model,
+                            speakers_to_wav: Dict[str, str],
+                            out_dir: str) -> Dict[str, Dict[str, str]]:
+    voice_latents_paths: Dict[str, Dict[str, str]] = {}
+    _safe_mkdir(out_dir)
+
+    for speaker, wav_path in speakers_to_wav.items():
+        abs_path = os.path.abspath(wav_path)
+        if not os.path.isfile(abs_path):
+            logger_xtts.warning("[XTTS] %s için referans wav bulunamadı: %s", speaker, abs_path)
+            continue
+        try:
+            lat = get_conditioning_latents_safe(model, abs_path)
+        except Exception as e:
+            logger_xtts.warning("[XTTS] %s latent çıkarılamadı: %s", speaker, e)
+            continue
+
+        spk_dir = os.path.join(out_dir, speaker)
+        _safe_mkdir(spk_dir)
+        paths = {}
+        gpt_path = os.path.join(spk_dir, "gpt.pt"); _save_tensor(lat["gpt"], gpt_path); paths["gpt"] = gpt_path
+        spk_path = os.path.join(spk_dir, "spk.pt"); _save_tensor(lat["spk"], spk_path); paths["spk"] = spk_path
+        if lat["diff"] is not None:
+            diff_path = os.path.join(spk_dir, "diff.pt"); _save_tensor(lat["diff"], diff_path); paths["diff"] = diff_path
+        voice_latents_paths[speaker] = paths
+        logger_xtts.info("[XTTS] %s için latents kaydedildi: %s", speaker, json.dumps(paths, ensure_ascii=False))
+
+    return voice_latents_paths
+
+def synthesize_with_optional_latents(model,
+                                     text: str,
+                                     out_path: str,
+                                     cfg: XttsConfig,
+                                     latents_paths: Optional[Dict[str, str]] = None,
+                                     speaker_wav: Optional[str] = None,
+                                     language: Optional[str] = None) -> str:
+    _safe_mkdir(os.path.dirname(out_path))
+    if cfg.tts == "xtts" and latents_paths:
+        try:
+            audio = model.synthesize(
+                text=text,
+                latents_path=latents_paths,
+                temperature=getattr(cfg, "temperature", 0.7),
+                language=language,
+                sample_rate=cfg.sample_rate,
+            )
+            _write_wav(audio, out_path, cfg.sample_rate)
+            return out_path
+        except Exception as e:
+            logger_xtts.warning("[XTTS] latent ile synth başarısız, wav fallback: %s", e)
+    if cfg.tts == "xtts" and speaker_wav:
+        audio = model.synthesize(
+            text=text,
+            speaker_wav=speaker_wav,
+            temperature=getattr(cfg, "temperature", 0.7),
+            language=language,
+            sample_rate=cfg.sample_rate,
+        )
+        _write_wav(audio, out_path, cfg.sample_rate)
+        return out_path
+    audio = model.synthesize(text=text, temperature=getattr(cfg, "temperature", 0.7), language=language, sample_rate=cfg.sample_rate)
+    _write_wav(audio, out_path, cfg.sample_rate)
+    return out_path
+
+def _write_wav(audio, out_path: str, sr: int):
+    import numpy as np
+    import soundfile as sf
+    if isinstance(audio, torch.Tensor):
+        audio = audio.detach().cpu().numpy()
+    elif not isinstance(audio, (list, tuple,)):
+        if isinstance(audio, dict) and "audio" in audio:
+            arr = audio["audio"]
+            if isinstance(arr, torch.Tensor):
+                arr = arr.detach().cpu().numpy()
+            audio = arr
+        else:
+            audio = np.asarray(audio)
+    audio = audio.astype("float32", copy=False)
+    sf.write(out_path, audio, sr)
+
+# ====================== Timeline / Diar Utils ======================
 @dataclass(frozen=True)
 class DiarSeg:
     start: float
@@ -111,8 +247,7 @@ def parse_simple_csv_lines(lines: List[str]) -> List[Dict[str, Any]]:
         out.append({"start": float(start_s), "end": float(end_s), "speaker": spk})
     return out
 
-# ================== OPTİMİZE EDİLMİŞ KONUŞMACI EŞLEME (mevcut) ===================
-
+# ================== OPTİMİZE EDİLMİŞ KONUŞMACI EŞLEME ===================
 @dataclass
 class SegmentMetrics:
     overlap_duration: float
@@ -176,7 +311,8 @@ class OptimizedSpeakerMapper:
         segments, words = self._final_consistency_pass(segments, words)
         return segments, words
 
-    # --- internal helpers (kısaltmadan korunuyor) ---
+    # (iç yardımcılar aynen)
+
     def _normalize_diarization(self, diar: List[Dict]) -> List[Dict]:
         normalized = []
         for d in diar:
@@ -189,8 +325,7 @@ class OptimizedSpeakerMapper:
         return sorted(normalized, key=lambda x: (x["start"], x["end"]))
 
     def _normalize_timeline(self, timeline: Optional[List[Dict]]) -> Optional[List[Dict]]:
-        if not timeline:
-            return None
+        if not timeline: return None
         normalized = []
         for t in timeline:
             normalized.append({
@@ -206,11 +341,7 @@ class OptimizedSpeakerMapper:
     def _normalize_vad(self, vad_regions: List[Dict[str, float]]) -> List[Dict[str, float]]:
         normalized = []
         for v in vad_regions:
-            normalized.append({
-                "start": float(v["start"]),
-                "end": float(v["end"]),
-                "duration": float(v["end"]) - float(v["start"])
-            })
+            normalized.append({"start": float(v["start"]), "end": float(v["end"]), "duration": float(v["end"]) - float(v["start"])})
         return sorted(normalized, key=lambda x: x["start"])
 
     def _calculate_segment_metrics(self, seg1_start: float, seg1_end: float, seg2_start: float, seg2_end: float) -> SegmentMetrics:
@@ -232,17 +363,13 @@ class OptimizedSpeakerMapper:
     def _calculate_confidence(self, overlap_stt: float, overlap_diar: float, iou: float, boundary_dist: float) -> float:
         boundary_score = max(0, 1 - (boundary_dist / 2.0))
         weights = {'overlap_stt': 0.35, 'overlap_diar': 0.25, 'iou': 0.25, 'boundary': 0.15}
-        confidence = (weights['overlap_stt'] * overlap_stt +
-                      weights['overlap_diar'] * overlap_diar +
-                      weights['iou'] * iou +
-                      weights['boundary'] * boundary_score)
+        confidence = (weights['overlap_stt'] * overlap_stt + weights['overlap_diar'] * overlap_diar + weights['iou'] * iou + weights['boundary'] * boundary_score)
         return min(1.0, max(0.0, confidence))
 
     def _adjust_boundaries_with_vad(self, segments: List[Dict], vad_regions: List[Dict]) -> List[Dict]:
         adjusted = []
         for seg in segments:
-            seg_start = float(seg.get("start", 0))
-            seg_end = float(seg.get("end", 0))
+            seg_start = float(seg.get("start", 0)); seg_end = float(seg.get("end", 0))
             best_vad = None; best_overlap = 0
             for vad in vad_regions:
                 overlap = min(seg_end, vad["end"]) - max(seg_start, vad["start"])
@@ -259,10 +386,8 @@ class OptimizedSpeakerMapper:
 
     def _get_speaker_candidates(self, segment: Dict, seg_idx: int, all_segments: List[Dict], diar_segments: List[Dict], timeline_segs: Optional[List[Dict]]) -> List[SpeakerCandidate]:
         candidates = []
-        seg_start = float(segment.get("start", 0))
-        seg_end = float(segment.get("end", 0))
-        if seg_end <= seg_start:
-            return candidates
+        seg_start = float(segment.get("start", 0)); seg_end = float(segment.get("end", 0))
+        if seg_end <= seg_start: return candidates
         speaker_scores = defaultdict(lambda: {'metrics': None, 'weight': 0})
         for diar_seg in diar_segments:
             metrics = self._calculate_segment_metrics(seg_start, seg_end, diar_seg["start"], diar_seg["end"])
@@ -283,8 +408,7 @@ class OptimizedSpeakerMapper:
         return candidates
 
     def _get_timeline_candidate(self, segment: Dict, timeline_segs: List[Dict]) -> Optional[SpeakerCandidate]:
-        seg_start = float(segment.get("start", 0))
-        seg_end = float(segment.get("end", 0))
+        seg_start = float(segment.get("start", 0)); seg_end = float(segment.get("end", 0))
         seg_mid = (seg_start + seg_end) / 2
         for tl_seg in timeline_segs:
             if tl_seg["start"] <= seg_mid <= tl_seg["end"]:
@@ -307,8 +431,7 @@ class OptimizedSpeakerMapper:
         return candidates
 
     def _select_best_candidate(self, candidates: List[SpeakerCandidate], segment: Dict, all_segments: List[Dict], seg_idx: int) -> Optional[SpeakerCandidate]:
-        if not candidates:
-            return None
+        if not candidates: return None
         best = candidates[0]
         high = [c for c in candidates if c.metrics.confidence > self.confidence_threshold]
         if len(high) > 1:
@@ -336,8 +459,7 @@ class OptimizedSpeakerMapper:
         return merged
 
     def _fix_isolated_segments(self, segments: List[Dict]) -> List[Dict]:
-        if len(segments) < 3:
-            return segments
+        if len(segments) < 3: return segments
         fixed = segments.copy()
         for i in range(1, len(segments) - 1):
             prev_speaker = segments[i-1].get("speaker")
@@ -399,8 +521,7 @@ class OptimizedSpeakerMapper:
         return {"assignment_sources": dict(self.assignment_stats),
                 "total_assignments": sum(self.assignment_stats.values())}
 
-# ========================== Pipeline Utilities (mevcut) ===========================
-
+# ========================== Pipeline Utilities ===========================
 MAX_BODY_BYTES = 26_214_400
 SOFT_LIMIT_BYTES = 24 * 1024 * 1024
 
@@ -409,8 +530,7 @@ class DebugWriter:
         self.enabled = enabled
         self.events: List[Dict[str, Any]] = []
     def snap(self, tag: str, **data: Any):
-        if not self.enabled:
-            return
+        if not self.enabled: return
         evt = {"tag": tag, "ts": time.time(), **data}
         self.events.append(evt)
         kv = " ".join(f"{k}={v}" for k, v in data.items())
@@ -422,7 +542,13 @@ def _require_ffmpeg():
             raise RuntimeError(f"{bin_name} bulunamadı. FFmpeg/FFprobe kurulu olmalı.")
 
 def _run(cmd: List[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        return subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Command failed: {' '.join(cmd)}")
+        logger.error(f"Exit code: {e.returncode}")
+        logger.error(f"Stderr: {e.stderr.decode('utf-8', errors='ignore')}")
+        raise
 
 def probe_duration_seconds(path: Path) -> float:
     _require_ffmpeg()
@@ -530,6 +656,94 @@ def transcribe_file(path: Path, model: str="whisper-1", language: Optional[str]=
             return _requests_transcribe_verbose(path, model, language, prompt, want_word_timestamps)
         raise
 
+# -------------------- Basit & Dayanıklı Çeviri --------------------
+def _openai_client_or_raise() -> OpenAI:
+    if OpenAI is None:
+        raise RuntimeError("openai paketi bulunamadı.")
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY tanımlı değil (çeviri için gerekli).")
+    return OpenAI()
+
+def _chat_translate_batch(client: OpenAI,
+                          items: List[Tuple[int, str]],
+                          src_lang: Optional[str],
+                          tgt_lang: str,
+                          model: str) -> List[str]:
+    """
+    items: [(sid, text)] – 1..N numaralı satırlar olarak prompt'a verilir.
+    Geri dönüş: sadece çeviriler, satır-satır (ör: N satır).
+    """
+    numbered = "\n".join(f"{i+1}. {t or ''}" for i, (_, t) in enumerate(items))
+    sys_msg = f"Sen profesyonel bir çevirmen ve altyazı yerleştirme uzmanısın. SADECE çeviri metnini döndür. Ek yorum, açıklama, numara yazma."
+    if src_lang:
+        sys_msg += f" Kaynak dil: {src_lang}. "
+    sys_msg += f"Hedef dil: {tgt_lang}. Noktalama ve büyük/küçük harf korunmalı, zamanlama veya ID yazma."
+    user_msg = f"Aşağıdaki {len(items)} satırı sırayla çevir. Her satırı kendi satırında döndür (1:1). Metinler:\n{numbered}"
+    try:
+        rsp = _safe_chat(client, model=model, system=sys_msg, user=user_msg)
+        out = [ln.strip() for ln in rsp.split("\n") if ln.strip() != ""]
+        # Eğer sayı/numara geldiyse temizle
+        cleaned: List[str] = []
+        for ln in out:
+            # "1. ..." veya "1) ..." veya "1 -" gibi ön ekleri temizle
+            cleaned.append(ln.split(" ", 1)[1].strip() if ln[:2].isdigit() and " " in ln else ln.lstrip("0123456789).:- ").strip())
+        # Satır sayısı uyuşmazsa alt/üst kırp
+        if len(cleaned) < len(items):
+            cleaned += [""] * (len(items)-len(cleaned))
+        return cleaned[:len(items)]
+    except Exception as e:
+        # Hata durumunda orijinal metni döndür (fail-open)
+        return [t for _, t in items]
+
+def _safe_chat(client: OpenAI, *, model: str, system: str, user: str) -> str:
+    # SDK değişikliklerine karşı sade kullanım
+    try:
+        comp = client.chat.completions.create(model=model, messages=[{"role":"system","content":system},{"role":"user","content":user}], temperature=0)
+        return comp.choices[0].message.content or ""
+    except Exception as e:
+        # Bazı SDK’lar new Responses API kullanıyor olabilir; basit fallback yoksa raise
+        raise
+
+def translate_segments(segments: List[dict],
+                       target_lang: str,
+                       model: str = "gpt-4o-mini",
+                       source_lang: Optional[str] = None,
+                       batch_size: int = 30,
+                       dbg: Optional[DebugWriter] = None) -> Tuple[List[dict], Dict[str, Any]]:
+    """
+    Segment metinlerini hedef dile çevirir, orijinali `orig_text` alanına koyar.
+    Boş veya çok kısa metinler atlanır.
+    """
+    if not segments:
+        return segments, {"translated": False}
+    client = _openai_client_or_raise()
+    # Hazırla: sadece metni olanları al
+    pending: List[Tuple[int, int, str]] = []  # (idx, seg_id, text)
+    for i, seg in enumerate(segments):
+        txt = (seg.get("text") or "").strip()
+        if not txt:
+            continue
+        pending.append((i, seg.get("id", i), txt))
+
+    if not pending:
+        return segments, {"translated": False}
+
+    # Toplu çeviri
+    total = len(pending)
+    done = 0
+    for k in range(0, total, batch_size):
+        chunk = pending[k:k+batch_size]
+        pairs = [(sid, txt) for (_, sid, txt) in chunk]
+        translations = _chat_translate_batch(client, pairs, source_lang, target_lang, model=model)
+        for (i, _, _), tr in zip(chunk, translations):
+            orig = segments[i].get("text", "")
+            segments[i]["orig_text"] = orig
+            segments[i]["text"] = tr or orig  # boş dönerse orijinali koru
+        done += len(chunk)
+        if dbg: dbg.snap("TRANSLATE_BATCH", size=len(chunk), done=done, total=total)
+
+    return segments, {"translated": True, "target_lang": target_lang, "model": model, "count": total}
+
 # -------------------- Pyannote VAD & Diarization --------------------
 def _vad_pyannote(wav_path: Path, dbg: DebugWriter) -> List[Dict[str, float]]:
     from pyannote.audio import Pipeline
@@ -538,9 +752,9 @@ def _vad_pyannote(wav_path: Path, dbg: DebugWriter) -> List[Dict[str, float]]:
         raise RuntimeError("HF_TOKEN tanımlı değil.")
     pipe = Pipeline.from_pretrained("pyannote/voice-activity-detection", use_auth_token=token)
     try:
-        import torch
-        if torch.cuda.is_available():
-            pipe.to(torch.device("cuda")); dbg.snap("VAD_INIT", device="cuda")
+        import torch as _t
+        if _t.cuda.is_available():
+            pipe.to(_t.device("cuda")); dbg.snap("VAD_INIT", device="cuda")
         else:
             dbg.snap("VAD_INIT", device="cpu")
     except Exception:
@@ -563,9 +777,9 @@ def _diarize_pyannote(wav_path: Path, speaker_count: Optional[int], dbg: DebugWr
         raise RuntimeError("HF_TOKEN tanımlı değil.")
     pipe = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=token)
     try:
-        import torch
-        if torch.cuda.is_available():
-            pipe.to(torch.device("cuda")); dbg.snap("DIAR_INIT", device="cuda")
+        import torch as _t
+        if _t.cuda.is_available():
+            pipe.to(_t.device("cuda")); dbg.snap("DIAR_INIT", device="cuda")
         else:
             dbg.snap("DIAR_INIT", device="cpu")
     except Exception:
@@ -598,11 +812,11 @@ def clip_segments_to_regions(segments: List[Dict[str, Any]], regions: List[Dict[
             ov = _overlap(s0, s1, r0, r1)
             if ov <= 0:
                 continue
-            out.append({"start": max(s0,r0), "end": min(s1,r1), "speaker": s["speaker"]})
-    out.sort(key=lambda d: (d["start"], d["end"], d["speaker"]))
+            out.append({"start": max(s0,r0), "end": min(s1,r1), "speaker": s["speaker"], "id": s.get("id"), "text": s.get("text")})
+    out.sort(key=lambda d: (d["start"], d["end"], d.get("speaker","")))
     merged: List[Dict[str, Any]] = []
     for seg in out:
-        if merged and merged[-1]["speaker"] == seg["speaker"] and abs(merged[-1]["end"] - seg["start"]) < 1e-6:
+        if merged and merged[-1].get("speaker") == seg.get("speaker") and abs(merged[-1]["end"] - seg["start"]) < 1e-6:
             merged[-1]["end"] = seg["end"]
         else:
             merged.append(seg)
@@ -656,11 +870,29 @@ def _write_outputs(outdir: Path, stem: str, segments: List[dict], words: List[di
     if diarization is not None:
         verbose["diarization"] = diarization
     if timeline is not None:
-        verbose["timeline"] = [
-            {"start": t.start, "end": t.end, "mode": t.mode, "speakers": list(t.speakers),
-             "channels": t.channels if t.channels else None}
-            for t in timeline
-        ]
+        verbose["timeline"] = []
+        for t in timeline:
+            if isinstance(t, dict):
+                # If timeline item is already a dict
+                verbose["timeline"].append(t)
+            elif hasattr(t, 'start'):
+                # If timeline item is an object with attributes
+                verbose["timeline"].append({
+                    "start": t.start,
+                    "end": t.end,
+                    "mode": t.mode,
+                    "speakers": list(t.speakers) if hasattr(t, 'speakers') else [],
+                    "channels": t.channels if hasattr(t, 'channels') else None
+                })
+            elif isinstance(t, tuple) and len(t) >= 2:
+                # If timeline item is a tuple (start, end)
+                verbose["timeline"].append({
+                    "start": t[0],
+                    "end": t[1],
+                    "mode": "speech",
+                    "speakers": [],
+                    "channels": None
+                })
     verbose_json_path.write_text(json.dumps(verbose, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def srt_time(t: float | None) -> str:
@@ -687,10 +919,28 @@ def _write_outputs(outdir: Path, stem: str, segments: List[dict], words: List[di
         with tcsv.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f); w.writerow(["start","end","mode","speakers","L","R"])
             for t in timeline:
-                spks = "|".join(t.speakers)
-                L = t.channels.get("L") if t.channels else ""
-                R = t.channels.get("R") if t.channels else ""
-                w.writerow([t.start, t.end, t.mode, spks, L, R])
+                if isinstance(t, dict):
+                    start = t.get("start", 0)
+                    end = t.get("end", 0)
+                    mode = t.get("mode", "speech")
+                    speakers = t.get("speakers", [])
+                    channels = t.get("channels", {})
+                elif isinstance(t, tuple) and len(t) >= 2:
+                    start, end = t[0], t[1]
+                    mode = "speech"
+                    speakers = []
+                    channels = {}
+                else:
+                    start = t.start
+                    end = t.end
+                    mode = t.mode
+                    speakers = t.speakers if hasattr(t, 'speakers') else []
+                    channels = t.channels if hasattr(t, 'channels') else {}
+
+                spks = "|".join(speakers) if speakers else ""
+                L = channels.get("L", "") if channels else ""
+                R = channels.get("R", "") if channels else ""
+                w.writerow([start, end, mode, spks, L, R])
 
     files = {
         "verbose_json": str(verbose_json_path),
@@ -702,80 +952,690 @@ def _write_outputs(outdir: Path, stem: str, segments: List[dict], words: List[di
         files["timeline_csv"] = str(outdir / f"{stem}.timeline.csv")
     return {"text": text, "language": language, "duration": duration, "files": files}
 
-# ======================= XTTS & Lipsync Yardımcıları =======================
 
-# 1) XTTSEngine import veya fallback (models.tts.xtts arayüzüne uyumlu)
-#    Eğer projedeki XTTS motoru import edilemezse, TTS.api ile aynı API'yi sağlayan basit bir sınıf kullanıyoruz.
+# ============ NO-OVERLAP: Aynı konuşmacı segmentleri asla çakışmasın ============
+def enforce_no_overlap_same_speaker(segments: List[dict], margin: float = 0.02) -> Tuple[List[dict], Dict[str, int]]:
+    """
+    Aynı konuşmacıya ait segmentler üst üste binmesin.
+    - Eğer seg.start < prev_end + margin ise, seg.start'ı prev_end + margin'e ileri al.
+    - Negatif/çok kısa kalan segmentleri at.
+    """
+    segs = sorted(copy.deepcopy(segments), key=lambda s: (float(s.get("start", 0.0)), float(s.get("end", 0.0))))
+    by_spk: Dict[str, List[dict]] = defaultdict(list)
+    for s in segs:
+        spk = str(s.get("speaker") or "")
+        by_spk[spk].append(s)
+
+    trims, drops = 0, 0
+    for spk, ss in by_spk.items():
+        ss.sort(key=lambda s: float(s.get("start", 0.0)))
+        prev_end = -1e9
+        for s in ss:
+            st = float(s.get("start", 0.0)); en = float(s.get("end", 0.0))
+            if st < prev_end + margin:
+                new_st = prev_end + margin
+                # çok kısa/negatif kalıyorsa bu segmenti at
+                if new_st >= en - 1e-3:
+                    s["_drop"] = True
+                    drops += 1
+                    continue
+                s["start"] = new_st
+                trims += 1
+            prev_end = float(s.get("end", 0.0))
+
+    cleaned: List[dict] = []
+    for s in segs:
+        if s.get("_drop"):
+            continue
+        cleaned.append(s)
+    return cleaned, {"trimmed": trims, "dropped": drops}
+
+
+# ================== DEMUX & MÜZİK YATAĞI & DUB MİX (FFmpeg/Separation) ==================
+def _extract_original_audio(video_in: Path, outdir: Path) -> Path:
+    outdir.mkdir(parents=True, exist_ok=True)
+    out = outdir / f"{video_in.stem}.orig.48k.wav"
+    _run(["ffmpeg", "-y", "-i", str(video_in), "-vn", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", str(out)])
+    return out
+
+def _extract_music_bed(video_in: Path, workdir: Path, dbg: Optional[DebugWriter] = None) -> Tuple[Path, bool]:
+    """
+    Müzik yatağını çıkar:
+      1) demucs varsa:  --two-stems vocals  -> no_vocals.wav
+      2) spleeter varsa: 2stems -> accompaniment.wav
+      3) fallback: orijinal ses (ducking ile konuşmayı basacağız)
+    Dönen: (music_bed_48k_stereo, separated?)
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    orig = _extract_original_audio(video_in, workdir)
+
+    # --- Demucs dene ---
+    try:
+        if shutil.which("demucs"):
+            sepdir = workdir / "demucs_sep"
+            cmd = ["demucs", "--two-stems", "vocals", "-o", str(sepdir), str(orig)]
+            _run(cmd)
+            candidates = list(sepdir.glob("**/no_vocals.wav"))
+            if candidates:
+                music = candidates[0]
+                bed = workdir / f"{video_in.stem}.music_bed.48k.wav"
+                _run(["ffmpeg", "-y", "-i", str(music), "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", str(bed)])
+                if dbg: dbg.snap("MUSIC_BED", method="demucs", file=str(bed))
+                return bed, True
+    except Exception as e:
+        if dbg: dbg.snap("MUSIC_BED_FAIL", method="demucs", err=str(e))
+
+    # --- Spleeter dene ---
+    try:
+        if shutil.which("spleeter"):
+            sepdir = workdir / "spleeter_sep"
+            cmd = ["spleeter", "separate", "-p", "spleeter:2stems", "-o", str(sepdir), str(orig)]
+            _run(cmd)
+            stem_dir = sepdir / orig.stem
+            for cand in [stem_dir / "accompaniment.wav", stem_dir / "accompaniment.flac"]:
+                if cand.exists():
+                    bed = workdir / f"{video_in.stem}.music_bed.48k.wav"
+                    _run(["ffmpeg", "-y", "-i", str(cand), "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", str(bed)])
+                    if dbg: dbg.snap("MUSIC_BED", method="spleeter", file=str(bed))
+                    return bed, True
+    except Exception as e:
+        if dbg: dbg.snap("MUSIC_BED_FAIL", method="spleeter", err=str(e))
+
+    # --- Fallback: orijinal ses (ducking ile bastırılacak) ---
+    if dbg: dbg.snap("MUSIC_BED", method="original_audio_fallback", file=str(orig))
+    return orig, False
+
+def _mix_music_and_dub(
+        video_in: Path,
+        dub_audio_wav: Path,
+        out_dir: Path,
+        dbg: Optional[DebugWriter] = None,
+        dub_gain_db: float = 0.0,
+        music_gain_db: float = -2.0,
+) -> Tuple[Path, Optional[Path]]:
+    """
+    Dublaj + müzik karışımı:
+      - Müzik yatağı ayrıştırılıyorsa (Demucs/Spleeter) onu kullan.
+      - Ayrışma yoksa, sidechaincompress + (hafif) mid-band azaltma ile orijinal konuşmayı bastır.
+      - Çıktı: 48k/stereo WAV (mux için).
+    """
+    mixdir = out_dir / "_mix"
+    mixdir.mkdir(parents=True, exist_ok=True)
+    music_bed, separated = _extract_music_bed(video_in, mixdir, dbg)
+
+    # Dub'u 48k/stereo normalize et
+    dub48 = mixdir / f"{Path(dub_audio_wav).stem}.48k.stereo.wav"
+    _run(["ffmpeg", "-y", "-i", str(dub_audio_wav), "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", str(dub48)])
+
+    final = out_dir / f"{video_in.stem}.final_mix.48k.wav"
+
+    # Ayrışma yoksa orta frekansları biraz kıs (300–3000 Hz civarı) + sidechain duck + amix
+    # Not: firequalizer çoğu ffmpeg build'ında var. Yoksa filter atlanır (hata almamak için separated True olduğunda zaten eklemiyoruz).
+    music_pre = "aformat=sample_rates=48000:channel_layouts=stereo"
+    if not separated:
+        music_pre += ",firequalizer=gain_entry='entry(300,-6);entry(1000,-8);entry(3000,-6)'"
+    music_pre += f",volume={10**(music_gain_db/20):.6f}"
+
+    filter_complex = (
+        f"[0:a]{music_pre}[m];"
+        f"[1:a]aformat=sample_rates=48000:channel_layouts=stereo,volume={10**(dub_gain_db/20):.6f}[v];"
+        f"[m][v]sidechaincompress=threshold=0.050:ratio=12:attack=15:release=250[duck];"
+        f"[duck][v]amix=inputs=2:normalize=0:duration=longest[mix]"
+    )
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(music_bed),
+        "-i", str(dub48),
+        "-filter_complex", filter_complex,
+        "-map", "[mix]",
+        "-ar", "48000", "-ac", "2",
+        "-c:a", "pcm_s16le",
+        str(final)
+    ]
+    _run(cmd)
+    if dbg: dbg.snap("DUB_MIX_DONE", final=str(final), separated_music=bool(separated))
+    return final, (music_bed if separated else None)
+
+
+# ======================= XTTS & Lipsync Yardımcıları =======================
+def _looks_like_url(s: str | None) -> bool:
+    if not s:
+        return False
+    s = s.strip().lower()
+    return s.startswith("http://") or s.startswith("https://")
+
+def _ensure_ytdlp() -> str:
+    """
+    İndirme için önce yt-dlp, yoksa youtube-dl arar.
+    """
+    for bin_name in ("yt-dlp", "youtube-dl"):
+        if shutil.which(bin_name) is not None:
+            return bin_name
+    raise RuntimeError("Ne 'yt-dlp' ne de 'youtube-dl' bulunamadı. Lütfen kur: pip install yt-dlp")
+
+def _download_via_ytdlp(url: str, outdir: Path, *, prefer_mp4: bool = True, dbg: Optional[DebugWriter] = None) -> Path:
+    """
+    URL'den videoyu indirir ve indirilen **nihai** dosyanın tam yolunu döndürür.
+    - Çıktıyı outdir'e sabitler (-P home:...)
+    - after_move:filepath ile nihai yolu alır (destekten yoksunsa legacy 'filename' fallback)
+    - MP4 tercihi varsa remux/merge ayarları eklenir, ancak .mkv/.webm gibi fallback çıktıları da kabul eder
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+    ytdlp = _ensure_ytdlp()
+
+    # Şablonu klasörsüz bırakıyoruz; klasörü -P ile belirliyoruz
+    template = "%(title).200B-%(id)s.%(ext)s"
+
+    base_cmd = [
+        ytdlp,
+        "--no-playlist",
+        "--no-progress",
+        "--newline",
+        "-N", "4",
+        "-P", f"home:{outdir}",
+        "-o", template,
+        "--no-part",           # .part dosyalarını bırakma
+        "--retries", "10",
+        "--fragment-retries", "10",
+    ]
+
+    if prefer_mp4:
+        # Uyumluysa MP4'e remux; mümkün değilse merge-output-format da MP4 denesin (yt-dlp gerekirse MKV'ye düşer)
+        base_cmd += ["--remux-video", "mp4", "--merge-output-format", "mp4"]
+
+    if dbg: dbg.snap("YTDLP_START", url=url, outdir=str(outdir))
+
+    # 1) Modern yol: after_move:filepath (postprocessor sonrası nihai yol)
+    try:
+        cmd = base_cmd + ["--print", "after_move:filepath", url]
+        cp = _run(cmd)
+        lines = [ln.strip() for ln in cp.stdout.decode(errors="ignore").splitlines() if ln.strip()]
+        for ln in reversed(lines):
+            p = Path(ln)
+            if p.exists():
+                if dbg: dbg.snap("YTDLP_DONE", file=str(p), size_bytes=p.stat().st_size)
+                return p
+    except subprocess.CalledProcessError as e:
+        # yt-dlp hata verirse üstte yakalanır; legacy denemeye geçeceğiz
+        pass
+
+    # 2) Legacy yol: filename (bazı sürümlerde post-move olmayabilir)
+    try:
+        cmd = base_cmd + ["--print", "filename", url]
+        cp = _run(cmd)
+        lines = [ln.strip() for ln in cp.stdout.decode(errors="ignore").splitlines() if ln.strip()]
+        for ln in reversed(lines):
+            p = Path(ln)
+            if p.exists():
+                if dbg: dbg.snap("YTDLP_DONE", file=str(p), size_bytes=p.stat().st_size)
+                return p
+    except subprocess.CalledProcessError:
+        # indirme başarısız olmuş olabilir; fallback glob taraması yine de denensin
+        pass
+
+    # 3) Son çare: outdir içinde en yeni video dosyasını yakala
+    exts = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+    candidates = [p for p in outdir.glob("*") if p.is_file() and p.suffix.lower() in exts]
+    if candidates:
+        p = max(candidates, key=lambda x: x.stat().st_mtime)
+        if dbg: dbg.snap("YTDLP_GLOB_PICK", file=str(p), size_bytes=p.stat().st_size)
+        return p
+
+    raise FileNotFoundError(
+        "İndirme başarısız ya da çıktı dosyası bulunamadı. "
+        "ffmpeg kurulu mu ve yt-dlp güncel mi? (pip install -U yt-dlp)"
+    )
+
 _HAS_XTTS = False
 try:
-    # Projede bulunan models.tts.xtts modülünü kullanmaya çalış
     from models.tts.xtts import XTTSEngine as _ProjectXTTSEngine  # noqa: F401
     _HAS_XTTS = True
 except Exception:
     _ProjectXTTSEngine = None
 
 class _FallbackXTTSEngine:
-    """Projede XTTS modülü yoksa basit Coqui TTS tabanlı fallback.
-    `XTTSEngine.synthesize(...)` imzasını taklit eder.  :contentReference[oaicite:2]{index=2}
-    """
     def __init__(self, model_name: str="tts_models/multilingual/multi-dataset/xtts_v2", language: str="tr"):
         self.model_name = model_name
         self.language = language
         from TTS.api import TTS  # type: ignore
         self._tts = TTS(model_name)
         try:
-            import torch
-            self._tts.to("cuda" if torch.cuda.is_available() else "cpu")
+            import torch as _t
+            self._tts.to("cuda" if _t.cuda.is_available() else "cpu")
         except Exception:
             pass
 
     def synthesize(self, text: str, output_path: Path, speaker_wav: str|None=None, latents_path: str|None=None, speed: float|None=None, lang: str|None=None) -> Path:
+        """
+        HIZ/SÜRE OYNAMAYAN SÜRÜM:
+        - speed parametresi tamamen yok sayılır.
+        - latents varsa doğrudan model.inference kullanılır.
+        - yoksa TTS.api ile dosyaya yazılır (split_sentences varsa yalnızca onu ayarlarız).
+        """
         assert not (speaker_wav and latents_path), "speaker_wav ve latents birlikte verilemez."
         lang = (lang or self.language or "tr")
+
         if latents_path:
-            # Latent ile inference (XTTS ile aynı dahili arayüz)
-            import torch, torchaudio
-            lat = torch.load(latents_path, map_location="cpu")
+            import torch as _t, torchaudio
+            lat = _t.load(latents_path, map_location="cpu")
             mdl = self._tts.synthesizer.tts_model
-            inf_kwargs = {
-                "text": text,
-                "language": lang,
-                "gpt_cond_latent": lat["gpt"],
-                "speaker_embedding": lat["spk"],
-            }
-            if "diff" in lat:
-                inf_kwargs["diffusion_conditioning"] = lat["diff"]
-            wav = mdl.inference(**inf_kwargs)
-            if not isinstance(wav, torch.Tensor):
-                wav = torch.tensor(wav)
+            wav = mdl.inference(
+                text=text,
+                language=lang,
+                gpt_cond_latent=lat["gpt"],
+                diffusion_conditioning=lat.get("diff"),
+                speaker_embedding=lat["spk"],
+            )
+            if not isinstance(wav, _t.Tensor):
+                wav = _t.tensor(wav)
             if wav.dim() == 1:
                 wav = wav.unsqueeze(0)
-            torchaudio.save(str(output_path), wav.to(torch.float32), 24000)
+            torchaudio.save(str(output_path), wav.to(_t.float32), 24000)
             return Path(output_path)
+
         if not speaker_wav or not Path(speaker_wav).is_file():
             raise FileNotFoundError(f"Speaker WAV bulunamadı: {speaker_wav}")
+
         kwargs = {
             "text": text,
             "language": lang,
             "file_path": str(output_path),
-            "speaker_wav": str(Path(speaker_wav).resolve())
+            "speaker_wav": str(Path(speaker_wav).resolve()),
         }
-        if speed is not None:
-            kwargs["speed"] = speed
-        # split_sentences param'ı her versiyonda olmayabilir
+        # Hız asla ayarlanmıyor; speed parametresi YOK SAYILIR.
         try:
             import inspect
-            if "split_sentences" in __import__("inspect").signature(self._tts.tts_to_file).parameters:
+            if "split_sentences" in inspect.signature(self._tts.tts_to_file).parameters:
                 kwargs["split_sentences"] = False if len(text or "") < 120 else True
         except Exception:
             pass
+
         self._tts.tts_to_file(**kwargs)
         return Path(output_path)
 
+def _ffmpeg_has_filter(filter_name: str) -> bool:
+    """Check if ffmpeg has a specific filter available (cached for rubberband)"""
+    global _FFMPEG_HAS_RUBBERBAND
+
+    if filter_name == "rubberband" and _FFMPEG_HAS_RUBBERBAND is not None:
+        return _FFMPEG_HAS_RUBBERBAND
+
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-filters"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        has_filter = filter_name in result.stdout
+    except Exception:
+        has_filter = False
+
+    if filter_name == "rubberband":
+        _FFMPEG_HAS_RUBBERBAND = has_filter
+
+    return has_filter
+
+# ==================== Segment Rebalancing for Tempo Limits ====================
+
+def _seg_duration(seg: dict) -> float:
+    """Calculate segment duration"""
+    return float(seg.get("end", 0)) - float(seg.get("start", 0))
+
+def _seg_gap(seg_a: dict, seg_b: dict) -> float:
+    """Calculate gap between two segments (negative if overlapping)"""
+    return float(seg_b.get("start", 0)) - float(seg_a.get("end", 0))
+
+def _tempo_needed(tts_duration: float, target_duration: float) -> float:
+    """Calculate required tempo factor for time stretching"""
+    target_duration = max(1e-6, target_duration)
+    return max(1e-6, tts_duration / target_duration)
+
+def _borrow_from_gaps(segments: List[dict], idx: int, need_extra: float) -> float:
+    """
+    Borrow time from neighboring gaps to extend target duration.
+    Returns amount of time gained.
+    """
+    gained = 0.0
+
+    # Try borrowing from next gap first
+    if idx < len(segments) - 1:
+        gap = _seg_gap(segments[idx], segments[idx + 1])
+        if gap > 0:
+            # Leave at least 20ms gap for safety
+            take = min(gap - 0.02, need_extra)
+            if take > 0:
+                segments[idx]["end"] = float(segments[idx]["end"]) + take
+                segments[idx + 1]["start"] = float(segments[idx + 1]["start"]) + take
+                gained += take
+                need_extra -= take
+
+    # If still need more, try borrowing from previous gap
+    if need_extra > 1e-6 and idx > 0:
+        gap = _seg_gap(segments[idx - 1], segments[idx])
+        if gap > 0:
+            take = min(gap - 0.02, need_extra)
+            if take > 0:
+                segments[idx - 1]["end"] = float(segments[idx - 1]["end"]) + take
+                gained += take
+
+    return gained
+
+def _can_merge_segments(seg_a: dict, seg_b: dict) -> bool:
+    """Check if two segments can be merged"""
+    if seg_a is None or seg_b is None:
+        return False
+
+    # Check speaker
+    same_speaker = (seg_a.get("speaker") and
+                   seg_a.get("speaker") == seg_b.get("speaker"))
+
+    # More aggressive merging criteria for better tempo control
+    # Merge if:
+    # 1. Same speaker AND (short segment OR small gap)
+    # 2. Different speaker BUT very short segment that needs extreme tempo
+
+    dur_b = _seg_duration(seg_b)
+    gap = _seg_gap(seg_a, seg_b)
+
+    # Same speaker - merge more aggressively
+    if same_speaker:
+        return dur_b <= 1.5 or gap <= 0.5  # Increased thresholds
+
+    # Different speaker - only merge if necessary for tempo
+    # (very short segments that would need extreme tempo)
+    return dur_b <= 0.3 and gap <= 0.1
+
+def _merge_segments(segments: List[dict], idx: int) -> bool:
+    """
+    Merge segment at idx with idx+1.
+    Returns True if merge was successful.
+    """
+    if idx >= len(segments) - 1:
+        return False
+
+    seg_a, seg_b = segments[idx], segments[idx + 1]
+
+    if not _can_merge_segments(seg_a, seg_b):
+        return False
+
+    # Merge text
+    text_a = (seg_a.get("text") or "").rstrip()
+    text_b = (seg_b.get("text") or "").lstrip()
+    merged_text = (text_a + (" " if text_a and text_b else "") + text_b).strip()
+
+    # Update segment
+    seg_a["text"] = merged_text
+    seg_a["end"] = max(float(seg_a["end"]), float(seg_b["end"]))
+
+    # Preserve other fields if they exist
+    if "orig_text" in seg_b and "orig_text" in seg_a:
+        orig_a = (seg_a.get("orig_text") or "").rstrip()
+        orig_b = (seg_b.get("orig_text") or "").lstrip()
+        seg_a["orig_text"] = (orig_a + (" " if orig_a and orig_b else "") + orig_b).strip()
+
+    # Remove merged segment
+    del segments[idx + 1]
+    return True
+
+def rebalance_segments_for_tempo(
+    segments: List[dict],
+    tts_durations: Dict[int, float],
+    tempo_min: float = 0.75,
+    tempo_max: float = 1.25,
+    max_passes: int = 2
+) -> List[dict]:
+    """
+    Rebalance segments to ensure tempo stays within limits.
+
+    Args:
+        segments: List of segments with id, start, end, text, speaker
+        tts_durations: Dictionary mapping segment id to TTS output duration
+        tempo_min: Minimum allowed tempo (default 0.75)
+        tempo_max: Maximum allowed tempo (default 1.25)
+        max_passes: Maximum optimization passes
+
+    Returns:
+        Rebalanced segments list
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    segments = sorted(segments, key=lambda s: float(s.get("start", 0)))
+
+    for pass_num in range(max_passes):
+        changed = False
+        i = 0
+
+        while i < len(segments):
+            seg = segments[i]
+            sid = seg.get("id", i)
+            target_duration = _seg_duration(seg)
+
+            # Get TTS duration or estimate
+            tts_duration = float(tts_durations.get(sid, target_duration))
+
+            # Calculate required tempo
+            tempo = _tempo_needed(tts_duration, target_duration)
+
+            # If tempo is within limits, continue
+            if tempo_min <= tempo <= tempo_max:
+                i += 1
+                continue
+
+            # Tempo too high (need to slow down) - extend target duration
+            if tempo > tempo_max:
+                # Calculate minimum target duration needed
+                min_target = tts_duration / tempo_max
+                need_extra = max(0.0, min_target - target_duration)
+
+                # Try borrowing from gaps
+                gained = _borrow_from_gaps(segments, i, need_extra)
+
+                # If not enough, try merging with neighbor
+                if gained + 1e-6 < need_extra:
+                    merged = _merge_segments(segments, i)
+                    if merged:
+                        logger.debug(f"Merged segment {sid} with next to reduce tempo")
+                        changed = True
+                        # Re-evaluate current segment
+                        continue
+
+                if gained > 0:
+                    logger.debug(f"Borrowed {gained:.3f}s for segment {sid}")
+                    changed = True
+
+            # Tempo too low (need to speed up) - reduce target duration
+            elif tempo < tempo_min:
+                # Calculate maximum target duration allowed
+                max_target = tts_duration / tempo_min
+                need_cut = max(0.0, target_duration - max_target)
+
+                if need_cut > 1e-3:
+                    # Try to shorten segment end
+                    new_end = float(seg["end"]) - need_cut
+                    min_duration = 0.05  # Minimum segment duration
+
+                    if new_end > float(seg["start"]) + min_duration:
+                        seg["end"] = new_end
+                        logger.debug(f"Shortened segment {sid} by {need_cut:.3f}s")
+                        changed = True
+                    else:
+                        # Segment would be too short, try merging
+                        if i > 0 and _can_merge_segments(segments[i-1], seg):
+                            # Merge with previous
+                            segments[i-1]["text"] = (
+                                (segments[i-1].get("text") or "").rstrip() + " " +
+                                (seg.get("text") or "").lstrip()
+                            ).strip()
+                            segments[i-1]["end"] = max(
+                                float(segments[i-1]["end"]),
+                                float(seg["end"])
+                            )
+                            del segments[i]
+                            logger.debug(f"Merged segment {sid} with previous")
+                            changed = True
+                            continue
+                        elif _merge_segments(segments, i):
+                            logger.debug(f"Merged segment {sid} with next")
+                            changed = True
+                            continue
+
+            i += 1
+
+        if not changed:
+            logger.info(f"Rebalancing converged after {pass_num + 1} passes")
+            break
+
+    return segments
+
+def estimate_tts_duration(text: str, language: str = "tr") -> float:
+    """
+    Estimate TTS duration based on text length.
+    Adjusted for XTTS behavior which tends to produce longer outputs.
+    """
+    if not text:
+        return 0.0
+
+    text = text.strip()
+    char_count = len(text)
+    word_count = len(text.split())
+
+    # XTTS tends to speak slower than natural speech
+    # Adjusted rates based on observed behavior
+    cps_rates = {
+        "tr": 10.0,  # Turkish (was 14.0, but XTTS is slower)
+        "en": 11.0,  # English (was 15.0)
+        "es": 10.5,  # Spanish
+        "fr": 10.0,  # French
+        "de": 9.5,   # German
+        "it": 10.5,  # Italian
+        "pt": 10.0,  # Portuguese
+        "ru": 9.0,   # Russian
+        "zh": 6.0,   # Chinese
+        "ja": 7.5,   # Japanese
+        "ko": 8.0,   # Korean
+        "ar": 9.0,   # Arabic
+    }
+
+    cps = cps_rates.get(language, 10.0)
+
+    # Base duration from character count
+    base_duration = char_count / cps
+
+    # XTTS has minimum durations for short texts
+    # and adds pauses between words
+    if word_count <= 2:
+        # Very short texts get minimum duration
+        min_duration = 0.8
+    elif word_count <= 5:
+        # Short texts get extra padding
+        min_duration = 1.2
+    else:
+        # Normal texts - add pause time between words
+        pause_per_word = 0.05  # 50ms average pause
+        min_duration = base_duration + (word_count * pause_per_word)
+
+    return max(min_duration, base_duration)
+
+def _time_stretch_to_duration(in_wav: Path, target_sec: float, out_wav: Path, enable: bool = True) -> Path:
+    """
+    Advanced time stretching with quality preservation.
+    Adjusts audio duration to match target while maintaining pitch and quality.
+    """
+    if not enable or target_sec <= 0:
+        # Fallback: just normalize without stretching
+        _run(["ffmpeg", "-y", "-i", str(in_wav), "-ar", "16000", "-ac", "1", str(out_wav)])
+        return out_wav
+
+    # Get current duration
+    current_duration = _ffprobe_duration(in_wav)
+
+    # If already close enough (within 50ms), still apply exact duration lock
+    if abs(current_duration - target_sec) < 0.05:
+        _run(["ffmpeg", "-y", "-i", str(in_wav),
+              "-af", f"aresample=16000,apad=pad_dur={target_sec:.6f},atrim=0:{target_sec:.6f}",
+              "-ac", "1", str(out_wav)])
+        return out_wav
+
+    # Calculate tempo factor (playback rate)
+    # tempo > 1 = speed up (shorter duration), tempo < 1 = slow down (longer duration)
+    tempo = current_duration / target_sec
+
+    # Log the adjustment for debugging
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.debug(f"Time stretch: {current_duration:.3f}s -> {target_sec:.3f}s (tempo={tempo:.3f})")
+
+    # Apply different strategies based on tempo factor
+    if 0.87 <= tempo <= 1.15:
+        # Small adjustment (±13%): Use atempo for best quality
+        atempo = _atempo_chain(tempo)
+        cmd = ["ffmpeg", "-y", "-i", str(in_wav),
+               "-af", f"{atempo},aresample=16000,apad=pad_dur={target_sec:.6f},atrim=0:{target_sec:.6f}",
+               "-ac", "1", str(out_wav)]
+        _run(cmd)
+
+    elif 0.5 <= tempo <= 2.0:
+        # Moderate adjustment: Use rubberband if available via ffmpeg filter
+        if _ffmpeg_has_filter("rubberband"):
+            # Use rubberband for better quality time stretching
+            cmd = ["ffmpeg", "-y", "-i", str(in_wav),
+                   "-af", f"rubberband=tempo={tempo:.6f}:pitch=1.0,aresample=16000,apad=pad_dur={target_sec:.6f},atrim=0:{target_sec:.6f}",
+                   "-ac", "1", str(out_wav)]
+        else:
+            # Fallback to atempo chain
+            atempo = _atempo_chain(tempo)
+            cmd = ["ffmpeg", "-y", "-i", str(in_wav),
+                   "-af", f"{atempo},aresample=16000,apad=pad_dur={target_sec:.6f},atrim=0:{target_sec:.6f}",
+                   "-ac", "1", str(out_wav)]
+        _run(cmd)
+
+    else:
+        # Extreme adjustment: Multi-pass approach for better quality
+        # First pass: Apply maximum safe stretch
+        temp_wav = out_wav.parent / f"{out_wav.stem}_temp.wav"
+
+        if tempo > 2.0:
+            # Need to speed up significantly
+            first_tempo = 2.0
+            remaining_tempo = tempo / 2.0
+        else:
+            # Need to slow down significantly
+            first_tempo = 0.5
+            remaining_tempo = tempo / 0.5
+
+        # First pass with intermediate resampling for quality
+        atempo1 = _atempo_chain(first_tempo)
+        cmd1 = ["ffmpeg", "-y", "-i", str(in_wav),
+                "-af", f"{atempo1},aresample=48000",
+                "-ac", "1", str(temp_wav)]
+        _run(cmd1)
+
+        # Second pass with exact duration lock
+        atempo2 = _atempo_chain(remaining_tempo)
+        cmd2 = ["ffmpeg", "-y", "-i", str(temp_wav),
+                "-af", f"{atempo2},aresample=16000,apad=pad_dur={target_sec:.6f},atrim=0:{target_sec:.6f}",
+                "-ac", "1", str(out_wav)]
+        _run(cmd2)
+
+        # Cleanup temp file
+        if temp_wav.exists():
+            temp_wav.unlink()
+
+    # Verify the output duration
+    final_duration = _ffprobe_duration(out_wav)
+    duration_error = abs(final_duration - target_sec)
+
+    if duration_error > 0.1:  # More than 100ms error
+        logger.warning(f"Time stretch accuracy issue: target={target_sec:.3f}s, got={final_duration:.3f}s, error={duration_error:.3f}s")
+
+    return out_wav
+
 def _load_xtts_engine(model_name: str, language: str):
-    """Projeden XTTSEngine varsa onu, yoksa fallback'ı dön."""
     if _ProjectXTTSEngine is not None:
-        return _ProjectXTTSEngine(model_name=model_name, language=language)  # :contentReference[oaicite:3]{index=3}
+        return _ProjectXTTSEngine(model_name=model_name, language=language)
     return _FallbackXTTSEngine(model_name=model_name, language=language)
 
 @dataclass
@@ -802,35 +1662,223 @@ def _atempo_chain(speed: float) -> str:
     chain.append(s)
     return ",".join(f"atempo={x:.6f}" for x in chain)
 
-def _time_stretch_to_duration(in_wav: Path, target_sec: float, out_wav: Path) -> Path:
-    src_dur = max(0.001, _ffprobe_duration(in_wav))
-    if target_sec <= 0:
-        shutil.copyfile(in_wav, out_wav); return out_wav
-    speed = src_dur / target_sec
-    chain = _atempo_chain(speed)
-    _run(["ffmpeg","-y","-i",str(in_wav), "-af", chain, "-ar","16000","-ac","1", str(out_wav)])
-    return out_wav
 
-def _concat_timeline_audio(segments: List[dict], seg_audio_paths: Dict[int, Path], total_len: float, out_wav: Path) -> Path:
+def _concat_timeline_audio(segments: List[dict], seg_audio_paths: Dict[int, Path], total_len: float, out_wav: Path, breath_gap_ms: int = 200) -> Path:
     _ensure_pydub()
     sr = 16000
+
+    # Create the output audio with proper timing
     out = AudioSegment.silent(duration=int(total_len * 1000), frame_rate=sr)
-    for s in segments:
+
+    # Global timing tracker for all segments
+    global_timeline = []
+    speaker_last_end = defaultdict(float)
+
+    # First pass: Calculate actual positions with global timing
+    segment_positions = []
+
+    for s in sorted(segments, key=lambda x: float(x.get("start", 0))):
         sid = s.get("id")
         if sid is None or sid not in seg_audio_paths:
             continue
+
+        speaker = s.get("speaker", "UNKNOWN")
+        original_start = float(s.get("start", 0))
+        original_end = float(s.get("end", 0))
+
+        # Load the TTS audio
         wav = AudioSegment.from_file(seg_audio_paths[sid])
         wav = wav.set_frame_rate(sr).set_channels(1)
-        start_ms = int(float(s.get("start", 0)) * 1000)
+        tts_duration = len(wav) / 1000.0
+
+        # Calculate adaptive breath gap (shorter for rapid exchanges, longer for topic changes)
+        adaptive_gap = breath_gap_ms
+        if len(segment_positions) > 0:
+            prev_seg = segment_positions[-1]
+            time_gap = original_start - prev_seg["original_end"]
+
+            # Reduce gap for rapid conversation (< 0.5s gap)
+            if time_gap < 0.5:
+                adaptive_gap = min(50, breath_gap_ms)
+            # Normal gap for regular pauses (0.5-1.5s)
+            elif time_gap < 1.5:
+                adaptive_gap = min(100, breath_gap_ms)
+            # Keep original gap for topic changes (> 1.5s)
+
+        # Global timing: respect original timing as much as possible
+        target_start_ms = int(original_start * 1000)
+
+        # Check for same-speaker overlap
+        if speaker in speaker_last_end:
+            min_start_ms = int(speaker_last_end[speaker] * 1000) + adaptive_gap
+            target_start_ms = max(target_start_ms, min_start_ms)
+
+        # Check for cross-speaker overlaps in global timeline
+        for placed in global_timeline:
+            placed_end_ms = placed["start_ms"] + placed["duration_ms"]
+            # If there's an overlap with any previously placed segment
+            if target_start_ms < placed_end_ms and (target_start_ms + len(wav)) > placed["start_ms"]:
+                # For different speakers, allow slight overlap (natural conversation)
+                if placed["speaker"] != speaker:
+                    # Allow up to 100ms overlap for natural conversation flow
+                    if target_start_ms < placed_end_ms - 100:
+                        target_start_ms = placed_end_ms - 100
+                else:
+                    # Same speaker must not overlap
+                    target_start_ms = placed_end_ms + adaptive_gap
+
+        segment_positions.append({
+            "segment": s,
+            "wav": wav,
+            "speaker": speaker,
+            "start_ms": target_start_ms,
+            "duration_ms": len(wav),
+            "original_start": original_start,
+            "original_end": original_end,
+            "adaptive_gap": adaptive_gap
+        })
+
+        # Update global timeline
+        global_timeline.append({
+            "speaker": speaker,
+            "start_ms": target_start_ms,
+            "duration_ms": len(wav)
+        })
+
+        # Update speaker tracking
+        speaker_last_end[speaker] = (target_start_ms + len(wav)) / 1000.0
+
+    # Second pass: Place audio with overlap redistribution
+    for pos_info in segment_positions:
+        start_ms = pos_info["start_ms"]
+        wav = pos_info["wav"]
+
+        # Apply with crossfade for smoother transitions
         out = out.overlay(wav, position=max(0, start_ms))
+
+    out = out.set_frame_rate(sr).set_channels(1)
+    out.export(out_wav, format="wav")
+    return out_wav
+
+def _concat_timeline_audio_with_sync(segments: List[dict], seg_audio_paths: Dict[int, Path], total_len: float, out_wav: Path) -> Path:
+    """
+    Advanced concatenation with sync anchoring and drift compensation.
+    - Places segments at exact timestamps
+    - Implements sync anchors every N segments
+    - Compensates for accumulated drift
+    """
+    _ensure_pydub()
+    import logging
+    logger = logging.getLogger(__name__)
+
+    sr = 16000
+    out = AudioSegment.silent(duration=int(total_len * 1000), frame_rate=sr)
+
+    # Configuration
+    SYNC_ANCHOR_INTERVAL = 10  # Create sync anchor every N segments
+    MAX_ALLOWED_DRIFT = 0.5   # Maximum allowed drift in seconds
+    CROSSFADE_MS = 10         # Crossfade duration for smoother transitions
+
+    # Tracking variables
+    segments_placed = 0
+    accumulated_drift = 0.0
+    last_anchor_time = 0.0
+    speaker_last_end = defaultdict(float)
+
+    # Sort segments by start time
+    sorted_segments = sorted(segments, key=lambda x: float(x.get("start", 0)))
+
+    for idx, seg in enumerate(sorted_segments):
+        sid = seg.get("id")
+        if sid is None or sid not in seg_audio_paths:
+            continue
+
+        speaker = seg.get("speaker", "UNKNOWN")
+        original_start = float(seg.get("start", 0))
+        original_end = float(seg.get("end", 0))
+
+        # Load the audio segment
+        wav = AudioSegment.from_file(seg_audio_paths[sid])
+        wav = wav.set_frame_rate(sr).set_channels(1)
+        actual_duration = len(wav) / 1000.0
+
+        # Calculate placement position
+        target_start = original_start
+
+        # Apply drift compensation at sync anchors
+        if segments_placed > 0 and segments_placed % SYNC_ANCHOR_INTERVAL == 0:
+            # This is a sync anchor point
+            if abs(accumulated_drift) > MAX_ALLOWED_DRIFT:
+                # Apply gradual drift correction
+                drift_correction = accumulated_drift * 0.5  # Correct 50% of drift
+                target_start -= drift_correction
+                accumulated_drift -= drift_correction
+                logger.info(f"Sync anchor at segment {segments_placed}: Corrected {drift_correction:.3f}s drift")
+
+            last_anchor_time = target_start
+
+        # Ensure no same-speaker overlap
+        if speaker in speaker_last_end:
+            min_gap = 0.02  # 20ms minimum gap between same speaker
+            min_start = speaker_last_end[speaker] + min_gap
+            if target_start < min_start:
+                adjustment = min_start - target_start
+                target_start = min_start
+                accumulated_drift += adjustment
+
+        # Place the segment
+        start_ms = int(target_start * 1000)
+
+        # Apply crossfade if overlapping with existing audio
+        if CROSSFADE_MS > 0 and start_ms > 0:
+            # Check if there's audio at this position
+            test_slice = out[max(0, start_ms - CROSSFADE_MS):start_ms + CROSSFADE_MS]
+            if test_slice.dBFS > -60:  # There's audio here
+                # Apply crossfade
+                wav_with_fade = wav.fade_in(CROSSFADE_MS)
+                out = out.overlay(wav_with_fade, position=max(0, start_ms))
+            else:
+                # No overlap, place normally
+                out = out.overlay(wav, position=max(0, start_ms))
+        else:
+            out = out.overlay(wav, position=max(0, start_ms))
+
+        # Update tracking
+        actual_end = target_start + actual_duration
+        speaker_last_end[speaker] = actual_end
+        segments_placed += 1
+
+        # Track drift
+        expected_end = original_end
+        segment_drift = actual_end - expected_end
+        accumulated_drift += segment_drift
+
+        # Log significant drift
+        if abs(segment_drift) > 0.1:
+            logger.debug(f"Segment {sid}: drift={segment_drift:.3f}s, accumulated={accumulated_drift:.3f}s")
+
+    # Final statistics
+    logger.info(f"Concatenation complete: {segments_placed} segments placed")
+    logger.info(f"Final accumulated drift: {accumulated_drift:.3f}s")
+
     out = out.set_frame_rate(sr).set_channels(1)
     out.export(out_wav, format="wav")
     return out_wav
 
 def _mux_audio_to_video(video_in: Path, audio_in: Path, video_out: Path) -> Path:
     _require_ffmpeg()
+
+    # Ensure input files exist
+    if not video_in.exists():
+        raise FileNotFoundError(f"Video file not found: {video_in}")
+    if not audio_in.exists():
+        raise FileNotFoundError(f"Audio file not found: {audio_in}")
+
+    # Ensure output directory exists
+    video_out.parent.mkdir(parents=True, exist_ok=True)
+
     _run(["ffmpeg","-y","-i",str(video_in),"-i",str(audio_in),
-          "-map","0:v:0","-map","1:a:0","-c:v","copy","-c:a","aac","-b:a","192k","-shortest",str(video_out)])
+          "-map","0:v:0","-map","1:a:0","-c:v","copy","-c:a","aac","-b:a","192k",str(video_out)])
     return video_out
 
 def _apply_wav2lip(video_in: Path, audio_in: Path, wav2lip_repo: Optional[Path], checkpoint: Optional[Path], out_video: Path, face_det_batch: int = 16) -> Optional[Path]:
@@ -848,7 +1896,6 @@ def _apply_wav2lip(video_in: Path, audio_in: Path, wav2lip_repo: Optional[Path],
         return None
 
 # ==================== Referans Ses & Latent Üretimi (BuildRef) ====================
-# Bu kısım, verdiğin build_ref_voices.py mantığına uygun şekilde implement edilmiştir.  :contentReference[oaicite:4]{index=4}
 def build_reference_voices(original_audio: Path,
                            segments: List[dict],
                            target_lang: str = "tr",
@@ -864,7 +1911,7 @@ def build_reference_voices(original_audio: Path,
     voices_dir.mkdir(parents=True, exist_ok=True)
 
     latents_map: Dict[str, str] = {}
-    # XTTS modeli (latents üretimi için) – XTTS modülü API’siyle birebir  :contentReference[oaicite:5]{index=5}
+    # XTTS modeli (latents üretimi için)
     try:
         xtts_engine = _load_xtts_engine("tts_models/multilingual/multi-dataset/xtts_v2", target_lang)
         xtts_model = xtts_engine._tts.synthesizer.tts_model
@@ -890,7 +1937,7 @@ def build_reference_voices(original_audio: Path,
             finish = min(int(end*1000) - margin_ms, len(audio))
             if finish <= begin: continue
             chunk = audio[begin:finish]
-            if chunk.dBFS == float("-inf") or chunk.dBFS < -45:  # sessiz/çok düşük SNR
+            if chunk.dBFS == float("-inf") or chunk.dBFS < -45:
                 continue
             collected.append(chunk)
             total_ms += len(chunk)
@@ -903,13 +1950,12 @@ def build_reference_voices(original_audio: Path,
             voice += c
         voice = voice[:seconds*1000]
         if voice.dBFS != float("-inf"):
-            voice = voice.apply_gain(-20.0 - voice.dBFS)  # normalize
+            voice = voice.apply_gain(-20.0 - voice.dBFS)
         voice = voice.set_channels(1).set_frame_rate(16000)
         out_path = voices_dir / f"{speaker}.wav"
         voice.export(out_path, format="wav")
         abs_path = str(out_path.resolve())
 
-        # cinsiyet çoğunluğu (varsa)
         genders = [seg.get("gender") for seg in segs if seg.get("gender") in ("M","F")]
         majority = _Counter(genders).most_common(1)[0][0] if genders else None
         for seg in segs:
@@ -920,44 +1966,15 @@ def build_reference_voices(original_audio: Path,
         if xtts_model is not None:
             try:
                 import torch as _torch
-
-                def _call_latents() -> Any:
-                    try:
-                        return xtts_model.get_conditioning_latents(audio_path=[abs_path])
-                    except TypeError:
-                        return xtts_model.get_conditioning_latents(abs_path)
-
                 try:
-                    latents = _call_latents()
-                except ValueError as exc:
-                    if "expected 3" in str(exc) and "got 2" in str(exc):
-                        latents = xtts_model.get_conditioning_latents(abs_path)
-                    else:
-                        raise
-
-                if isinstance(latents, tuple):
-                    if len(latents) == 3:
-                        gpt, diff, spk = latents
-                        payload = {
-                            "gpt": gpt.detach().cpu(),
-                            "diff": diff.detach().cpu(),
-                            "spk": spk.detach().cpu(),
-                        }
-                    elif len(latents) == 2:
-                        gpt, spk = latents
-                        payload = {
-                            "gpt": gpt.detach().cpu(),
-                            "spk": spk.detach().cpu(),
-                        }
-                    else:
-                        raise ValueError(
-                            f"Unexpected number of conditioning latents: {len(latents)}"
-                        )
-                else:
-                    raise ValueError("Unexpected return type from get_conditioning_latents")
-
+                    lat = get_conditioning_latents_safe(xtts_model, abs_path)
+                except Exception as e:
+                    print(f"[XTTS] {speaker} latent çıkarılamadı:", e)
+                    continue
                 lat_path = voices_dir / f"{speaker}.latents.pt"
-                _torch.save(payload, lat_path)
+                _torch.save({"gpt": lat["gpt"].detach().cpu(),
+                             "diff": (lat["diff"].detach().cpu() if lat["diff"] is not None else None),
+                             "spk": lat["spk"].detach().cpu()}, lat_path)
                 latents_map[speaker] = str(lat_path.resolve())
                 print(f"[XTTS] {speaker} latent kaydedildi -> {lat_path}")
             except Exception as e:
@@ -966,19 +1983,72 @@ def build_reference_voices(original_audio: Path,
     return voices_dir, latents_map
 
 # ==================== Segment Bazlı XTTS -> Süre Uydurma -> Birleştirme =============
-def synthesize_dub_track_xtts(segments: List[dict],
-                              all_text: Optional[str],
-                              voices_dir: Path,
-                              latents_map: Dict[str, str],
-                              target_lang: str,
-                              out_dir: Path,
-                              xtts_cfg: Optional[XTTSConfig] = None) -> Tuple[Path, Dict[int, Path]]:
+def synthesize_dub_track_xtts(
+        segments: List[dict],
+        all_text: Optional[str],
+        voices_dir: Path,
+        latents_map: Dict[str, str],
+        target_lang: str,
+        out_dir: Path,
+        xtts_cfg: Optional[XTTSConfig] = None,
+        fit_to_segments: bool = True,
+        use_tempo_limits: bool = True,
+        tempo_min: float = 0.75,
+        tempo_max: float = 1.25
+) -> Tuple[Path, Dict[int, Path]]:
+    """
+    Segment-based XTTS synthesis with duration matching.
+    - Synthesizes TTS for each segment
+    - Optionally rebalances segments to stay within tempo limits
+    - Applies time stretching to match original segment duration
+    - Tracks and compensates for timing drift
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
     xtts_cfg = xtts_cfg or XTTSConfig(language=target_lang)
-    tts = _load_xtts_engine(xtts_cfg.model_name, xtts_cfg.language)  # :contentReference[oaicite:6]{index=6}
+    tts = _load_xtts_engine(xtts_cfg.model_name, xtts_cfg.language)
 
     seg_audio: Dict[int, Path] = {}
     tmp_audio_dir = out_dir / "_tts_segments"
     tmp_audio_dir.mkdir(parents=True, exist_ok=True)
+
+    # If using tempo limits, first estimate TTS durations and rebalance
+    if use_tempo_limits and fit_to_segments:
+        logger.info("Estimating TTS durations for tempo rebalancing...")
+
+        # Phase 1: Estimate TTS durations for all segments
+        tts_durations = {}
+        for seg in segments:
+            sid = seg.get("id")
+            if sid is None:
+                continue
+            text = (seg.get("text") or "").strip()
+            if text:
+                # Use estimation for now (could do actual TTS here for accuracy)
+                estimated_duration = estimate_tts_duration(text, target_lang)
+                tts_durations[sid] = estimated_duration
+
+        # Phase 2: Rebalance segments to stay within tempo limits
+        logger.info(f"Rebalancing segments for tempo limits [{tempo_min}, {tempo_max}]...")
+        segments = rebalance_segments_for_tempo(
+            segments=segments,
+            tts_durations=tts_durations,
+            tempo_min=tempo_min,
+            tempo_max=tempo_max,
+            max_passes=5  # More passes for better optimization
+        )
+        logger.info(f"Rebalancing complete. {len(segments)} segments remain.")
+
+    # Track duration statistics for monitoring
+    duration_stats = {
+        "total_original": 0.0,
+        "total_tts": 0.0,
+        "total_stretched": 0.0,
+        "max_drift": 0.0,
+        "segments_processed": 0,
+        "tempos": []
+    }
 
     for seg in segments:
         sid = seg.get("id")
@@ -987,38 +2057,102 @@ def synthesize_dub_track_xtts(segments: List[dict],
         text = (seg.get("text") or "").strip()
         if not text:
             continue
-        start = float(seg.get("start", 0.0)); end = float(seg.get("end", 0.0))
-        target_len = max(0.01, end - start)
+
+        # Get original segment duration
+        seg_start = float(seg.get("start", 0.0))
+        seg_end = float(seg.get("end", 0.0))
+        original_duration = seg_end - seg_start
+
+        if original_duration <= 0:
+            logger.warning(f"Invalid segment duration for ID {sid}: {original_duration}s")
+            continue
+
+        duration_stats["total_original"] += original_duration
 
         spk = str(seg.get("speaker") or "UNKNOWN")
         spk_wav = voices_dir / f"{spk}.wav"
         lat_path = latents_map.get(spk)
 
+        # Generate TTS output
         raw_out = tmp_audio_dir / f"seg_{sid:06d}.raw.wav"
         if lat_path:
-            tts.synthesize(text, output_path=raw_out, latents_path=lat_path, lang=target_lang)  # :contentReference[oaicite:7]{index=7}
+            tts.synthesize(text, output_path=raw_out, latents_path=lat_path, lang=target_lang)
         else:
             if not spk_wav.exists():
-                # fallback: herhangi bir referans
                 fallback = next(iter(voices_dir.glob("*.wav")), None)
                 if fallback is None:
                     raise RuntimeError("Referans ses bulunamadı.")
                 spk_wav = fallback
-            tts.synthesize(text, output_path=raw_out, speaker_wav=str(spk_wav), lang=target_lang)  # :contentReference[oaicite:8]{index=8}
+            tts.synthesize(text, output_path=raw_out, speaker_wav=str(spk_wav), lang=target_lang)
 
+        # Get TTS output duration
+        tts_duration = _ffprobe_duration(raw_out)
+        duration_stats["total_tts"] += tts_duration
+
+        # Apply time stretching to match original duration
         stretched = tmp_audio_dir / f"seg_{sid:06d}.fit.wav"
-        if xtts_cfg.speed is not None:
-            chain = _atempo_chain(xtts_cfg.speed)
-            _run(["ffmpeg","-y","-i",str(raw_out), "-af", chain, "-ar","16000","-ac","1", str(stretched)])
-        else:
-            _time_stretch_to_duration(raw_out, target_len, stretched)
-        seg_audio[sid] = stretched
 
-    total_len = 0.0
-    if segments:
-        total_len = max(total_len, float(segments[-1].get("end", 0.0)))
+        if fit_to_segments:
+            # ALWAYS match original duration exactly to prevent drift
+            target_duration = original_duration
+
+            # Apply time stretching
+            _time_stretch_to_duration(raw_out, target_sec=target_duration, out_wav=stretched, enable=True)
+
+            # Log significant adjustments
+            tempo = tts_duration / target_duration
+            duration_stats["tempos"].append(tempo)
+
+            if abs(tempo - 1.0) > 0.1:  # More than 10% adjustment
+                logger.info(f"Segment {sid} ({spk}): TTS {tts_duration:.2f}s -> Target {target_duration:.2f}s (tempo: {tempo:.2f})")
+
+            # Warn if tempo is outside preferred limits (even after rebalancing)
+            if use_tempo_limits and (tempo < tempo_min or tempo > tempo_max):
+                logger.warning(f"Segment {sid} tempo {tempo:.2f} outside limits [{tempo_min}, {tempo_max}]")
+
+        else:
+            # No time stretching, just normalize
+            _time_stretch_to_duration(raw_out, target_sec=0.0, out_wav=stretched, enable=False)
+
+        # Verify stretched duration
+        final_duration = _ffprobe_duration(stretched)
+        duration_stats["total_stretched"] += final_duration
+
+        # Track maximum drift
+        drift = abs(final_duration - original_duration)
+        if drift > duration_stats["max_drift"]:
+            duration_stats["max_drift"] = drift
+
+        seg_audio[sid] = stretched
+        duration_stats["segments_processed"] += 1
+
+    # Log duration statistics
+    if duration_stats["segments_processed"] > 0:
+        logger.info(f"Duration Statistics:")
+        logger.info(f"  Total Original: {duration_stats['total_original']:.2f}s")
+        logger.info(f"  Total TTS: {duration_stats['total_tts']:.2f}s")
+        logger.info(f"  Total Stretched: {duration_stats['total_stretched']:.2f}s")
+        logger.info(f"  Max Single Drift: {duration_stats['max_drift']:.2f}s")
+        logger.info(f"  Overall Drift: {abs(duration_stats['total_stretched'] - duration_stats['total_original']):.2f}s")
+
+        # Log tempo statistics
+        if duration_stats["tempos"]:
+            tempos = duration_stats["tempos"]
+            min_tempo = min(tempos)
+            max_tempo = max(tempos)
+            avg_tempo = sum(tempos) / len(tempos)
+            logger.info(f"  Tempo Range: [{min_tempo:.2f}, {max_tempo:.2f}], Avg: {avg_tempo:.2f}")
+
+            if use_tempo_limits:
+                out_of_range = sum(1 for t in tempos if t < tempo_min or t > tempo_max)
+                if out_of_range > 0:
+                    logger.warning(f"  {out_of_range}/{len(tempos)} segments outside tempo limits")
+
+    # Concatenate with improved timing
+    total_len = max((float(s.get("end", 0.0)) for s in segments), default=0.0)
     full_wav = out_dir / "dubbed.timeline.mono16k.wav"
-    _concat_timeline_audio(segments, seg_audio, total_len, full_wav)
+    _concat_timeline_audio_with_sync(segments, seg_audio, total_len, full_wav)
+
     return full_wav, seg_audio
 
 # ==================== Basit Lipsync (Wav2Lip) + Fallback Mux ======================
@@ -1046,7 +2180,7 @@ def lipsync_or_mux(video_in: Path,
     out_path = _mux_audio_to_video(video_in, dub_audio_wav, muxed)
     return out_path, used_lipsync
 
-# ========================= Main Pipeline (genişletilmiş) ==========================
+# ========================= Main Pipeline (çeviri entegre) ==========================
 def process_video_wordwise(
         video_path: str,
         output_dir: str,
@@ -1068,20 +2202,54 @@ def process_video_wordwise(
         use_vad_boundaries: bool = True,
         use_timeline: bool = True,
         confidence_threshold: float = 0.6,
+        # ------ ÇEVİRİ ------
+        do_translate: bool = True,
+        translator_model: Optional[str] = "gpt-4o-mini",
         # ------ Dublaj & Lipsync ------
         do_dub: bool = True,
         target_lang: Optional[str] = None,
         xtts_model_name: str = "tts_models/multilingual/multi-dataset/xtts_v2",
         xtts_speed: Optional[float] = None,
+        fit_to_segments: bool = True,
         do_lipsync: bool = True,
         wav2lip_repo: Optional[str] = None,
-        wav2lip_checkpoint: Optional[str] = None
+        wav2lip_checkpoint: Optional[str] = None,
+        # ------ Speaker Analysis & Demucs ------
+        analyze_speakers: bool = True,
+        remove_overlaps: bool = True,
+        use_demucs: bool = True,
+        demucs_model: str = "htdemucs",
+        instrumental_volume: float = 0.8,
+        dubbing_volume: float = 1.0
 ) -> dict:
     dbg = DebugWriter(enabled=debug)
-    src = Path(video_path)
     out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
-    if not src.exists():
-        raise FileNotFoundError(f"Girdi bulunamadı: {src}")
+
+    # 1) Yerel dosya mı?
+    src: Optional[Path] = None
+    if video_path and not _looks_like_url(str(video_path)):
+        cand = Path(video_path)
+        if cand.exists():
+            src = cand
+
+    # 2) Değilse URL mi? (video_path URL ise ya da boşsa ve YOUTUBE_URL env tanımlıysa)
+    if src is None:
+        url_candidate: Optional[str] = None
+        if _looks_like_url(str(video_path) if video_path is not None else None):
+            url_candidate = str(video_path).strip()
+        elif not video_path:
+            env_url = os.getenv("YOUTUBE_URL", "").strip()
+            if _looks_like_url(env_url):
+                url_candidate = env_url
+
+        if url_candidate:
+            dl_dir = out / "_downloads"
+            src = _download_via_ytdlp(url_candidate, dl_dir, dbg=dbg)
+        else:
+            raise FileNotFoundError(f"Girdi bulunamadı ve URL verilmedi: {video_path!r}")
+
+        # Bu noktada src kesin Path ve mevcut
+
 
     # Audio processing
     audio = transcode_audio_under_limit(src, out / "_work", dbg=dbg)
@@ -1156,6 +2324,32 @@ def process_video_wordwise(
                 if best_spk is not None:
                     s["speaker"] = best_spk
 
+
+        merged_segments, noov_stats = enforce_no_overlap_same_speaker(merged_segments, margin=0.02)
+        if debug:
+            dbg.snap("NO_OVERLAP_ENFORCED", **noov_stats)
+
+        # ------ Speaker Analysis & Overlap Removal ------
+        if analyze_speakers and merged_segments:
+            analyzer = SpeakerSegmentAnalyzer(
+                min_segment_duration=0.2,
+                merge_gap_threshold=0.5,
+                overlap_tolerance=0.1
+            )
+
+            # Analyze segments by speaker
+            speaker_analyses = analyzer.analyze_segments(merged_segments)
+
+            # Remove cross-speaker overlaps if requested
+            if remove_overlaps:
+                merged_segments = analyzer.remove_cross_speaker_overlaps(merged_segments)
+                dbg.snap("SPEAKER_OVERLAPS_REMOVED", segment_count=len(merged_segments))
+
+            # Export speaker analysis
+            analysis_path = out / "speaker_analysis.json"
+            analysis_result = analyzer.export_analysis(str(analysis_path))
+            dbg.snap("SPEAKER_ANALYSIS_EXPORTED", path=str(analysis_path))
+
         # RTTM & speakers CSV
         rttm_path = out / f"{wav_for_diar.stem}.diarization.rttm"
         _write_rttm(diar_segments, rttm_path, uri=src.stem)
@@ -1166,21 +2360,29 @@ def process_video_wordwise(
                 w.writerow([d["start"], d["end"], d["speaker"]])
         dbg.snap("DIAR_FILES", rttm=str(rttm_path), speakers_csv=str(spk_csv))
 
+    # ---------------- ÇEVİRİ (hedef dil seçimi ve uygulama) ----------------
+    tlang = target_lang or (lang or "tr")
+    translation_meta = {"translated": False}
+    if do_translate and tlang:
+        merged_segments, translation_meta = translate_segments(
+            merged_segments, target_lang=tlang,
+            model=(translator_model or llm_model),
+            source_lang=lang, batch_size=30, dbg=dbg
+        )
+        dbg.snap("TRANSLATE_DONE", **translation_meta)
+
     # ---------------- DUBLaj + LİPSYNC ENTEGRASYON ----------------
     dub_audio_wav = None
     lipsync_video = None
     lipsync_used  = False
 
     if do_dub:
-        tlang = target_lang or (lang or "tr")
-        # 1) Referans sesler + latents (build_ref_voices.py ile uyumlu)  :contentReference[oaicite:9]{index=9}
         voices_dir, latents_map = build_reference_voices(
             original_audio=wav_for_diar,
             segments=merged_segments,
             target_lang=tlang,
             workdir=out / "_work"
         )
-        # 2) XTTS sentez + süre uydurma + tek iz birleştirme  :contentReference[oaicite:10]{index=10}
         dub_audio_wav, seg_audio_map = synthesize_dub_track_xtts(
             segments=merged_segments,
             all_text=" ".join(merged_texts).strip(),
@@ -1190,7 +2392,6 @@ def process_video_wordwise(
             out_dir=out,
             xtts_cfg=XTTSConfig(model_name=xtts_model_name, language=tlang, speed=xtts_speed)
         )
-        # 3) Basit Lipsync (opsiyonel Wav2Lip) + fallback mux
         if do_lipsync:
             lipsync_video, lipsync_used = lipsync_or_mux(
                 video_in=src,
@@ -1209,12 +2410,69 @@ def process_video_wordwise(
                 wav2lip_ckpt=None
             )
 
+        # ------ Demucs Vocal Separation & Mixing ------
+        if use_demucs and dub_audio_wav:
+            separator = DemucsVocalSeparator(model=demucs_model)
+
+            if separator.is_available:
+                # Separate vocals from original audio
+                demucs_output = out / "demucs_output"
+                stems = separator.separate_vocals(
+                    str(wav_for_diar),
+                    str(demucs_output)
+                )
+
+                if stems:
+                    # Mix dubbing with instrumental
+                    mixer = DubbingMixer(
+                        instrumental_volume=instrumental_volume,
+                        dubbing_volume=dubbing_volume
+                    )
+
+                    # Create final mix with instrumental
+                    final_output = out / "final_dubbed_with_music.wav"
+                    mixed_path = mixer.mix_dubbing_with_instrumental(
+                        str(dub_audio_wav),
+                        stems["instrumental"],
+                        str(final_output)
+                    )
+                    dbg.snap("DEMUCS_MIX_CREATED", path=str(mixed_path))
+
+                    # Create video with the mixed audio if requested
+                    if lipsync_video:
+                        final_video = out / "final_dubbed_video_with_music.mp4"
+                        _mux_audio_to_video(Path(lipsync_video) if isinstance(lipsync_video, str) else lipsync_video,
+                                          Path(mixed_path), final_video)
+                        lipsync_video = final_video
+                        dbg.snap("FINAL_VIDEO_WITH_MUSIC", path=str(final_video))
+
+                    # Also create adaptive mix if we have speaker timelines
+                    if analyze_speakers and 'speaker_analyses' in locals():
+                        speaker_timelines = {}
+                        for speaker_id in speaker_analyses:
+                            timeline = analyzer.get_speaker_timeline(speaker_id)
+                            speaker_timelines[speaker_id] = timeline
+
+                        if speaker_timelines:
+                            adaptive_output = out / "adaptive_dubbed.wav"
+                            adaptive_path = mixer.create_adaptive_mix(
+                                str(wav_for_diar),
+                                str(dub_audio_wav),
+                                stems["instrumental"],
+                                str(adaptive_output),
+                                speaker_timelines
+                            )
+                            dbg.snap("ADAPTIVE_MIX_CREATED", path=str(adaptive_path))
+            else:
+                logger.warning("Demucs not available, skipping vocal separation")
+
     # ---------------- ÇIKTILAR ----------------
     last_seg_end = 0.0
     if merged_segments:
         last_seg_end = max(float(s.get("end",0.0)) for s in merged_segments)
     summary = _write_outputs(out, src.stem, merged_segments, merged_words, " ".join(merged_texts).strip(), lang, last_seg_end, diarization=diar_segments, timeline=timeline)
     summary["models"] = {"stt": stt_model, "llm": llm_model}
+    summary["translation"] = {"enabled": bool(do_translate), **translation_meta, "source_lang": lang, "target_lang": tlang}
     if diar_segments:
         summary["files"]["speakers_csv"] = str(out / f"{src.stem}.speakers.csv")
         rttm_guess = out / f"{audio.stem}.diarization.rttm"
@@ -1226,7 +2484,7 @@ def process_video_wordwise(
     if do_dub and dub_audio_wav:
         summary.setdefault("files", {})["dub_audio_wav"] = str(dub_audio_wav)
         summary["dub"] = {
-            "target_lang": target_lang or (lang or "tr"),
+            "target_lang": tlang,
             "xtts_model": xtts_model_name,
             "audio_wav": str(dub_audio_wav),
             "video": str(lipsync_video) if lipsync_video else None,
@@ -1247,8 +2505,8 @@ def process_video_wordwise(
 # ============================= Example Run =============================
 if __name__ == "__main__":
     res = process_video_wordwise(
-        video_path="sample2.mp4",
-        output_dir="output2",
+        video_path="",
+        output_dir="output",
         stt_model="whisper-1",
         language=None,
         prompt=None,
@@ -1266,6 +2524,9 @@ if __name__ == "__main__":
         use_vad_boundaries=True,
         use_timeline=True,
         confidence_threshold=0.6,
+        # ÇEVİRİ
+        do_translate=True,                 # <—— ÇEVİRİ ETKİN
+        translator_model="gpt-4o",    # (istersen gpt-4o)
         # DUB + LIPSYNC
         do_dub=True,
         target_lang="tr",  # hedef dil
@@ -1273,6 +2534,13 @@ if __name__ == "__main__":
         xtts_speed=None,   # None -> segment süresine otomatik esnetme
         do_lipsync=True,
         wav2lip_repo=None,        # örn: "/opt/Wav2Lip"
-        wav2lip_checkpoint=None   # örn: "/opt/Wav2Lip/checkpoints/Wav2Lip.pth"
+        wav2lip_checkpoint=None,  # örn: "/opt/Wav2Lip/checkpoints/Wav2Lip.pth"
+        # Speaker Analysis & Demucs
+        analyze_speakers=True,
+        remove_overlaps=True,
+        use_demucs=True,
+        demucs_model="htdemucs",
+        instrumental_volume=0.8,
+        dubbing_volume=1.0
     )
     print(json.dumps(res, ensure_ascii=False, indent=2))
