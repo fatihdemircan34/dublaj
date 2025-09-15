@@ -1,0 +1,162 @@
+{
+  "statistics": {
+    "total_segments": 50,
+    "max_drift": 2.4424906541753444e-15,
+    "avg_drift": -1.3569392523196357e-15,
+    "drift_variance": 3.3356155560271177e-31,
+    "sync_points": [
+      {
+        "segment_id": 5,
+        "original_time": 12.0,
+        "actual_time": 12.0,
+        "drift": -6.661338147750939e-16,
+        "corrected": false,
+        "correction_applied": 0.0
+      },
+      {
+        "segment_id": 10,
+        "original_time": 24.5,
+        "actual_time": 24.5,
+        "drift": -6.661338147750939e-16,
+        "corrected": false,
+        "correction_applied": 0.0
+      },
+      {
+        "segment_id": 15,
+        "original_time": 37.5,
+        "actual_time": 37.5,
+        "drift": -8.881784197001252e-16,
+        "corrected": false,
+        "correction_applied": 0.0
+      },
+      {
+        "segment_id": 20,
+        "original_time": 49.5,
+        "actual_time": 49.5,
+        "drift": -8.881784197001252e-16,
+        "corrected": false,
+        "correction_applied": 0.0
+      },
+      {
+        "segment_id": 25,
+        "original_time": 62.0,
+        "actual_time": 62.0,
+        "drift": -1.5543122344752192e-15,
+        "corrected": false,
+        "correction_applied": 0.0
+      },
+      {
+        "segment_id": 30,
+        "original_time": 75.0,
+        "actual_time": 75.0,
+        "drift": -1.5543122344752192e-15,
+        "corrected": false,
+        "correction_applied": 0.0
+      },
+      {
+        "segment_id": 35,
+        "original_time": 87.0,
+        "actual_time": 87.0,
+        "drift": -1.7763568394002505e-15,
+        "corrected": false,
+        "correction_applied": 0.0
+      },
+      {
+        "segment_id": 40,
+        "original_time": 99.5,
+        "actual_time": 99.5,
+        "drift": -1.7763568394002505e-15,
+        "corrected": false,
+        "correction_applied": 0.0
+      },
+      {
+        "segment_id": 45,
+        "original_time": 112.5,
+        "actual_time": 112.5,
+        "drift": -2.4424906541753444e-15,
+        "corrected": false,
+        "correction_applied": 0.0
+      }
+    ],
+    "final_drift": -2.4424906541753444e-15
+  },
+  "sync_points": [
+    {
+      "segment_id": 5,
+      "original_time": 12.0,
+      "actual_time": 12.0,
+      "drift": -6.661338147750939e-16,
+      "corrected": false,
+      "correction_applied": 0.0
+    },
+    {
+      "segment_id": 10,
+      "original_time": 24.5,
+      "actual_time": 24.5,
+      "drift": -6.661338147750939e-16,
+      "corrected": false,
+      "correction_applied": 0.0
+    },
+    {
+      "segment_id": 15,
+      "original_time": 37.5,
+      "actual_time": 37.5,
+      "drift": -8.881784197001252e-16,
+      "corrected": false,
+      "correction_applied": 0.0
+    },
+    {
+      "segment_id": 20,
+      "original_time": 49.5,
+      "actual_time": 49.5,
+      "drift": -8.881784197001252e-16,
+      "corrected": false,
+      "correction_applied": 0.0
+    },
+    {
+      "segment_id": 25,
+      "original_time": 62.0,
+      "actual_time": 62.0,
+      "drift": -1.5543122344752192e-15,
+      "corrected": false,
+      "correction_applied": 0.0
+    },
+    {
+      "segment_id": 30,
+      "original_time": 75.0,
+      "actual_time": 75.0,
+      "drift": -1.5543122344752192e-15,
+      "corrected": false,
+      "correction_applied": 0.0
+    },
+    {
+      "segment_id": 35,
+      "original_time": 87.0,
+      "actual_time": 87.0,
+      "drift": -1.7763568394002505e-15,
+      "corrected": false,
+      "correction_applied": 0.0
+    },
+    {
+      "segment_id": 40,
+      "original_time": 99.5,
+      "actual_time": 99.5,
+      "drift": -1.7763568394002505e-15,
+      "corrected": false,
+      "correction_applied": 0.0
+    },
+    {
+      "segment_id": 45,
+      "original_time": 112.5,
+      "actual_time": 112.5,
+      "drift": -2.4424906541753444e-15,
+      "corrected": false,
+      "correction_applied": 0.0
+    }
+  ],
+  "configuration": {
+    "max_allowed_drift": 0.3,
+    "sync_interval": 5,
+    "correction_factor": 0.6
+  }
+}

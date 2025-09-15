@@ -1,0 +1,223 @@
+--- a/miniapp.py
++++ b/miniapp.py
+@@ -585,6 +585,28 @@ def probe_duration_seconds(path: Path) -> float:
+     except Exception:
+         return 0.0
+
++def _trim_audio_to_video_length(audio_in: Path, video_in: Path, audio_out: Path, safety_ms: int = 10) -> Path:
++    """
++    audio_in'i video_in süresine kadar TRIM'ler (küçük bir güvenlik marjıyla).
++    Sonda donmayı kesin engeller. Çıkış WAV/PCM (tek encode noktası mux).
++    """
++    vid_dur = probe_duration_seconds(video_in)
++    if vid_dur <= 0:
++        _run(["ffmpeg","-y","-i",str(audio_in),"-c","copy",str(audio_out)])
++        return audio_out
++    target = max(0.0, vid_dur - (safety_ms/1000.0))
++    _run([
++        "ffmpeg","-y",
++        "-i", str(audio_in),
++        "-af", f"atrim=0:{target:.6f},asetpts=N/SR/TB",
++        "-ar","48000","-ac","2",
++        "-c:a","pcm_s16le",
++        str(audio_out)
++    ])
++    return audio_out
++
+@@ -736,7 +758,7 @@ def _mix_music_and_dub(
+-    final = out_dir / f"{video_in.stem}.final_mix.48k.wav"
++    final_raw = out_dir / f"{video_in.stem}.final_mix.48k.wav"
+@@ -753,13 +775,18 @@ def _mix_music_and_dub(
+-    filter_complex = (
+-        f"[0:a]{music_pre}[m];"
+-        f"[1:a]aformat=sample_rates=48000:channel_layouts=stereo,volume={10**(dub_gain_db/20):.6f}[v];"
+-        f"[m][v]sidechaincompress=threshold=0.050:ratio=12:attack=15:release=250[duck];"
+-        f"[duck][v]amix=inputs=2:normalize=0:duration=longest[mix]"
+-    )
++    # duration=shortest + minik fade-out — miks en kısa akıma hizalanır
++    filter_complex = (
++        f"[0:a]{music_pre}[m];"
++        f"[1:a]aformat=sample_rates=48000:channel_layouts=stereo,volume={10**(dub_gain_db/20):.6f}[v];"
++        f"[m][v]sidechaincompress=threshold=0.050:ratio=12:attack=15:release=250[duck];"
++        f"[duck][v]amix=inputs=2:normalize=0:duration=shortest,afade=t=out:st=0:d=0.01[mix]"
++    )
+@@ -769,11 +796,17 @@ def _mix_music_and_dub(
+-        "-c:a", "pcm_s16le",
+-        str(final)
++        "-c:a", "pcm_s16le",
++        str(final_raw)
+     ]
+     _run(cmd)
+-    if dbg: dbg.snap("DUB_MIX_DONE", final=str(final), separated_music=bool(separated))
+-    return final, (music_bed if separated else None)
++    # miks sonrası garantili trim
++    final = out_dir / f"{video_in.stem}.final_mix.48k.trimmed.wav"
++    _trim_audio_to_video_length(final_raw, video_in, final, safety_ms=10)
++    if dbg: dbg.snap("DUB_MIX_DONE", final=str(final), separated_music=bool(separated))
++    return final, (music_bed if separated else None)
+
+@@ -1120,41 +1153,77 @@ def _concat_timeline_audio_with_sync(segments: List[dict], seg_audio_paths: Dict[int, Path], total_len: float, out_wav: Path) -> Path:
+-    # Configuration
+-    SYNC_ANCHOR_INTERVAL = 10  # Create sync anchor every N segments
+-    MAX_ALLOWED_DRIFT = 0.5   # Maximum allowed drift in seconds
+-    CROSSFADE_MS = 10         # Crossfade duration for smoother transitions
+-
+-    # Tracking variables
+-    segments_placed = 0
+-    accumulated_drift = 0.0
+-    last_anchor_time = 0.0
+-    speaker_last_end = defaultdict(float)
+-
+-    # Sort segments by start time
+-    sorted_segments = sorted(segments, key=lambda x: float(x.get("start", 0)))
++    # Hafif optimize anchor konfigürasyonu
++    SYNC_ANCHOR_INTERVAL = 20     # periyodik hard anchor
++    LONG_PAUSE_ANCHOR    = 0.60   # >=600ms durak -> hard anchor
++    CROSSFADE_MS         = 30     # daha yumuşak geçiş
++    MIN_GAP_SAME_SPK     = 0.02   # aynı konuşmacıda min boşluk
++    ALLOW_OVERLAP_DIFF   = 0.10   # farklı spk max 100ms üst üste
++
++    segments_placed    = 0
++    accumulated_drift  = 0.0
++    prev_original_end  = None
++    prev_speaker       = None
++    speaker_last_end   = defaultdict(float)
++
++    sorted_segments = sorted(segments, key=lambda x: float(x.get("start", 0)))
+@@ -1162,37 +1231,66 @@ def _concat_timeline_audio_with_sync(segments: List[dict], seg_audio_paths: Dict[int, Path], total_len: float, out_wav: Path) -> Path:
+-        # Calculate placement position
+-        target_start = original_start
+-
+-        # Apply drift compensation at sync anchors
+-        if segments_placed > 0 and segments_placed % SYNC_ANCHOR_INTERVAL == 0:
+-            # This is a sync anchor point
+-            if abs(accumulated_drift) > MAX_ALLOWED_DRIFT:
+-                # Apply gradual drift correction
+-                drift_correction = accumulated_drift * 0.5  # Correct 50% of drift
+-                target_start -= drift_correction
+-                accumulated_drift -= drift_correction
+-                logger.info(f"Sync anchor at segment {segments_placed}: Corrected {drift_correction:.3f}s drift")
+-
+-            last_anchor_time = target_start
+-
+-        # Ensure no same-speaker overlap
+-        if speaker in speaker_last_end:
+-            min_gap = 0.02  # 20ms minimum gap between same speaker
+-            min_start = speaker_last_end[speaker] + min_gap
+-            if target_start < min_start:
+-                adjustment = min_start - target_start
+-                target_start = min_start
+-                accumulated_drift += adjustment
++        s0 = float(seg.get("start", 0.0))
++        s1 = float(seg.get("end",   0.0))
++        target_start = s0
++
++        # Anchor tetikleyicileri
++        hard_anchor = False
++        soft_anchor = False
++        if segments_placed > 0 and (segments_placed % SYNC_ANCHOR_INTERVAL == 0):
++            hard_anchor = True
++        if prev_original_end is not None and (s0 - prev_original_end) >= LONG_PAUSE_ANCHOR:
++            hard_anchor = True
++        if prev_speaker is not None and speaker != prev_speaker:
++            soft_anchor = True
++
++        # drift düzeltmesi
++        if hard_anchor:
++            target_start -= accumulated_drift
++            accumulated_drift = 0.0
++        elif soft_anchor:
++            correction = accumulated_drift * 0.8
++            target_start -= correction
++            accumulated_drift -= correction
++
++        if speaker in speaker_last_end:
++            min_start = speaker_last_end[speaker] + MIN_GAP_SAME_SPK
++            if target_start < min_start:
++                adjustment = (min_start - target_start)
++                target_start = min_start
++                accumulated_drift += adjustment
+
+-        # Place the segment
+-        start_ms = int(target_start * 1000)
++        start_ms = max(0, int(round(target_start * 1000)))
+@@ -1201,27 +1299,27 @@ def _concat_timeline_audio_with_sync(segments: List[dict], seg_audio_paths: Dict[int, Path], total_len: float, out_wav: Path) -> Path:
+-        # Apply crossfade if overlapping with existing audio
+-        if CROSSFADE_MS > 0 and start_ms > 0:
+-            # Check if there's audio at this position
+-            test_slice = out[max(0, start_ms - CROSSFADE_MS):start_ms + CROSSFADE_MS]
+-            if test_slice.dBFS > -60:  # There's audio here
+-                # Apply crossfade
+-                wav_with_fade = wav.fade_in(CROSSFADE_MS)
+-                out = out.overlay(wav_with_fade, position=max(0, start_ms))
+-            else:
+-                # No overlap, place normally
+-                out = out.overlay(wav, position=max(0, start_ms))
+-        else:
+-            out = out.overlay(wav, position=max(0, start_ms))
++        if CROSSFADE_MS > 0 and start_ms > 0:
++            test_slice = out[max(0, start_ms - CROSSFADE_MS): start_ms + CROSSFADE_MS]
++            if test_slice.dBFS > -60:
++                out = out.overlay(wav.fade_in(CROSSFADE_MS), position=start_ms)
++            else:
++                out = out.overlay(wav, position=start_ms)
++        else:
++            out = out.overlay(wav, position=start_ms)
+@@ -1235,10 +1333,12 @@ def _concat_timeline_audio_with_sync(...):
+-        # Track drift
+-        expected_end = original_end
++        expected_end = s1
+         segment_drift = actual_end - expected_end
+         accumulated_drift += segment_drift
+         if abs(segment_drift) > 0.1:
+             logger.debug(f"Segment {sid}: drift={segment_drift:.3f}s, accumulated={accumulated_drift:.3f}s")
++        prev_original_end = s1
++        prev_speaker = speaker
+
+     logger.info(f"Concatenation complete: {segments_placed} segments placed")
+     logger.info(f"Final accumulated drift: {accumulated_drift:.3f}s")
+@@ -1250,12 +1350,20 @@ def _mux_audio_to_video(video_in: Path, audio_in: Path, video_out: Path) -> Path:
+-    _run(["ffmpeg","-y","-i",str(video_in),"-i",str(audio_in),
+-          "-map","0:v:0","-map","1:a:0","-c:v","copy","-c:a","aac","-b:a","192k",str(video_out)])
++    _run([
++        "ffmpeg","-y",
++        "-i", str(video_in),
++        "-i", str(audio_in),
++        "-map","0:v:0","-map","1:a:0",
++        "-c:v","copy",
++        "-c:a","aac","-b:a","192k",
++        "-movflags","+faststart",
++        "-shortest",
++        str(video_out)
++    ])
+     return video_out
+@@ -1300,8 +1408,16 @@ def lipsync_or_mux(...):
+-    if ls_path and ls_path.exists():
++    if ls_path and ls_path.exists():
+         used_lipsync = True
+         return ls_path, used_lipsync
+-    out_path = _mux_audio_to_video(video_in, dub_audio_wav, muxed)
++    # Fallback: mux öncesi güvenli trim
++    safe_dir = out_dir / "_sync"
++    safe_dir.mkdir(parents=True, exist_ok=True)
++    trimmed_for_mux = safe_dir / "dub.trimmed.for_mux.wav"
++    _trim_audio_to_video_length(dub_audio_wav, video_in, trimmed_for_mux, safety_ms=10)
++    out_path = _mux_audio_to_video(video_in, trimmed_for_mux, muxed)
+     return out_path, used_lipsync
+@@ -1442,6 +1558,11 @@ def process_video_wordwise(
+         dub_audio_wav, seg_audio_map = synthesize_dub_track_xtts(
+             segments=merged_segments,
+             all_text=" ".join(merged_texts).strip(),
+             voices_dir=voices_dir,
+             latents_map=latents_map,
+             target_lang=tlang,
+             out_dir=out,
+             xtts_cfg=XTTSConfig(model_name=xtts_model_name, language=tlang, speed=xtts_speed)
+         )
++        # Lipsync/mux öncesi — sesin videoyu aşmadığından emin ol
++        safe_dub = out / "dubbed.timeline.mono16k.safe.wav"
++        _trim_audio_to_video_length(dub_audio_wav, src, safe_dub, safety_ms=10)
++        dub_audio_wav = safe_dub
+         if do_lipsync:
+             lipsync_video, lipsync_used = lipsync_or_mux(
+                 video_in=src,

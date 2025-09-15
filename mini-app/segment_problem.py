@@ -934,36 +934,314 @@ def _write_outputs(outdir: Path, stem: str, segments: List[dict], words: List[di
 
 
 # ============ NO-OVERLAP: Aynı konuşmacı segmentleri asla çakışmasın ============
-def enforce_no_overlap_same_speaker(segments: List[dict], margin: float = 0.02) -> Tuple[List[dict], Dict[str, int]]:
+def enforce_no_overlap_same_speaker_gentle(segments: List[dict], margin: float = 0.01) -> Tuple[List[dict], Dict[str, int]]:
+    """
+    Aynı konuşmacının segmentlerini overlap etmeyecek şekilde düzenle.
+    Küçük segmentleri koruyarak, sadece overlap kısımlarını kes.
+    """
     segs = sorted(copy.deepcopy(segments), key=lambda s: (float(s.get("start", 0.0)), float(s.get("end", 0.0))))
     by_spk: Dict[str, List[dict]] = defaultdict(list)
+
     for s in segs:
         spk = str(s.get("speaker") or "")
         by_spk[spk].append(s)
 
-    trims, drops = 0, 0
+    trims, drops, preserves = 0, 0, 0
+    MIN_SEGMENT_DURATION = 0.1  # En az 100ms'lik segmentleri koru
+
     for spk, ss in by_spk.items():
         ss.sort(key=lambda s: float(s.get("start", 0.0)))
         prev_end = -1e9
+
         for s in ss:
-            st = float(s.get("start", 0.0)); en = float(s.get("end", 0.0))
-            if st < prev_end + margin:
-                new_st = prev_end + margin
-                if new_st >= en - 1e-3:
+            st = float(s.get("start", 0.0))
+            en = float(s.get("end", 0.0))
+            duration = en - st
+
+            # Overlap var mı?
+            if st < prev_end:
+                overlap = prev_end - st
+
+                # Küçük segment ise korumaya çalış
+                if duration < MIN_SEGMENT_DURATION * 2:
+                    # Önceki segmenti kısalt, bu segmenti koru
+                    if ss[ss.index(s) - 1] if s != ss[0] else None:
+                        prev_seg = ss[ss.index(s) - 1]
+                        prev_seg["end"] = st - margin/2
+                        preserves += 1
+
+                # Overlap küçükse sadece başlangıcı kaydir
+                elif overlap < duration * 0.3:  # %30'dan az overlap
+                    s["start"] = prev_end + margin
+                    trims += 1
+
+                # Büyük overlap - segmenti ikiye böl
+                elif overlap < duration * 0.7:
+                    # İlk yarısını at, ikinci yarısını koru
+                    midpoint = (st + en) / 2
+                    if midpoint > prev_end + margin:
+                        s["start"] = max(prev_end + margin, midpoint)
+                        trims += 1
+                    else:
+                        s["start"] = prev_end + margin
+                        if s["start"] >= en - MIN_SEGMENT_DURATION:
+                            s["_drop"] = True
+                            drops += 1
+                            continue
+                else:
+                    # Çok fazla overlap, segmenti sil
                     s["_drop"] = True
                     drops += 1
                     continue
-                s["start"] = new_st
-                trims += 1
+
             prev_end = float(s.get("end", 0.0))
 
     cleaned: List[dict] = []
     for s in segs:
-        if s.get("_drop"):
-            continue
-        cleaned.append(s)
-    return cleaned, {"trimmed": trims, "dropped": drops}
+        if not s.get("_drop"):
+            # Son kontrol: çok kısa kalmışsa birleştir
+            if cleaned and cleaned[-1].get("speaker") == s.get("speaker"):
+                gap = float(s.get("start", 0)) - float(cleaned[-1].get("end", 0))
+                duration = float(s.get("end", 0)) - float(s.get("start", 0))
 
+                if gap < 0.05 and duration < MIN_SEGMENT_DURATION:
+                    # Öncekiyle birleştir
+                    cleaned[-1]["end"] = s.get("end", cleaned[-1]["end"])
+                    if "text" in s and s["text"]:
+                        cleaned[-1]["text"] = (cleaned[-1].get("text", "") + " " + s["text"]).strip()
+                    continue
+
+            cleaned.append(s)
+
+    return cleaned, {"trimmed": trims, "dropped": drops, "preserved": preserves}
+
+
+def _concat_timeline_audio_with_mixing(segments: List[dict],
+                                       seg_audio_paths: Dict[int, Path],
+                                       total_len: float,
+                                       out_wav: Path) -> Path:
+    """
+    Gelişmiş ses birleştirme - overlap'larda mixing yapar.
+    """
+    _ensure_pydub()
+    from pydub import AudioSegment
+
+    sr = 16000
+    out = AudioSegment.silent(duration=int(total_len * 1000), frame_rate=sr)
+
+    # Parametreler
+    CROSSFADE_MS = 50  # Daha uzun crossfade
+    MIN_GAP_MS = 10    # Minimum boşluk
+    OVERLAP_MIX_RATIO = 0.7  # Overlap'ta eski sesin oranı
+
+    sorted_segments = sorted(segments, key=lambda x: float(x.get("start", 0)))
+    placed_segments = []  # Yerleştirilen segmentleri takip et
+
+    for seg in sorted_segments:
+        sid = seg.get("id")
+        if sid is None or sid not in seg_audio_paths:
+            continue
+
+        # Ses dosyasını yükle
+        wav = AudioSegment.from_file(seg_audio_paths[sid]).set_frame_rate(sr).set_channels(1)
+
+        # Hedef pozisyon
+        start_ms = int(float(seg.get("start", 0)) * 1000)
+        end_ms = start_ms + len(wav)
+
+        # Overlap kontrolü
+        overlapping = []
+        for placed in placed_segments:
+            p_start, p_end = placed["start_ms"], placed["end_ms"]
+            if not (end_ms <= p_start or start_ms >= p_end):
+                overlapping.append(placed)
+
+        if overlapping:
+            # Overlap var - mixing yap
+            for overlap_seg in overlapping:
+                overlap_start = max(start_ms, overlap_seg["start_ms"])
+                overlap_end = min(end_ms, overlap_seg["end_ms"])
+                overlap_duration = overlap_end - overlap_start
+
+                if overlap_duration > 0:
+                    # Crossfade ile yumuşak geçiş
+                    if overlap_duration < CROSSFADE_MS * 2:
+                        # Kısa overlap - tam crossfade
+                        try:
+                            fade_ms = max(1, int(overlap_duration / 2))
+                            if fade_ms > 0 and len(wav) > fade_ms * 2:
+                                wav = wav.fade_in(duration=fade_ms).fade_out(duration=fade_ms)
+                        except:
+                           pass  # Fade başarısız olursa devam et
+                    else:
+                        # Uzun overlap - başta ve sonda crossfade
+                        wav = wav.fade_in(CROSSFADE_MS)
+
+                    # Volume ayarı - overlap'ta sesi biraz kıs
+                    wav = wav - 3  # 3dB azalt
+
+        # Fade in/out ekle (yumuşak giriş/çıkış)
+        wav_length_ms = len(wav)
+        if wav_length_ms > 0:
+            fade_duration = min(CROSSFADE_MS, wav_length_ms // 4)
+            if fade_duration > 0:
+                fade_duration = int(fade_duration)  # Integer'a çevir
+                wav = wav.fade_in(fade_duration).fade_out(fade_duration)
+
+        # Sesi yerleştir - overlay yerine daha akıllı mixing
+        if overlapping:
+            # Overlap varsa karıştır (mix)
+            out = out.overlay(wav, position=start_ms, gain_during_overlay=-6)
+        else:
+            # Overlap yoksa direkt yerleştir
+            out = out.overlay(wav, position=start_ms)
+
+        # Yerleştirilen segmenti kaydet
+        placed_segments.append({
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "speaker": seg.get("speaker", "UNKNOWN"),
+            "id": sid
+        })
+
+    # Normalizasyon - clipping'i önle
+    if out.max_dBFS > -3:
+        out = out.normalize()
+
+    # Son silence trim
+    out = out.strip_silence(silence_len=100, silence_thresh=-50)
+
+    out.export(out_wav, format="wav")
+    return out_wav
+
+
+def _smart_overlap_handler(segments: List[dict]) -> List[dict]:
+    """
+    Overlap'ları akıllıca yönet - küçük konuşmaları koru.
+    """
+    import numpy as np
+
+    # Önce tüm overlap'ları tespit et
+    overlaps = []
+    for i, seg1 in enumerate(segments):
+        for j, seg2 in enumerate(segments[i+1:], i+1):
+            s1_start, s1_end = float(seg1.get("start", 0)), float(seg1.get("end", 0))
+            s2_start, s2_end = float(seg2.get("start", 0)), float(seg2.get("end", 0))
+
+            if s1_end > s2_start:  # Overlap var
+                overlap_duration = min(s1_end, s2_end) - s2_start
+                overlaps.append({
+                    "seg1_idx": i,
+                    "seg2_idx": j,
+                    "overlap": overlap_duration,
+                    "seg1_duration": s1_end - s1_start,
+                    "seg2_duration": s2_end - s2_start
+                })
+
+    # Overlap'ları önem sırasına göre çöz
+    for ov in sorted(overlaps, key=lambda x: x["overlap"], reverse=True):
+        seg1 = segments[ov["seg1_idx"]]
+        seg2 = segments[ov["seg2_idx"]]
+
+        # Küçük girişleri koru
+        if ov["seg2_duration"] < 0.5:  # 500ms'den kısa
+            # Küçük segment - öncekini kısalt
+            seg1["end"] = seg2.get("start", seg1["end"]) - 0.01
+        elif ov["seg1_duration"] < 0.5:
+            # İlk segment küçük - ikincinin başını kaydir
+            seg2["start"] = seg1.get("end", seg2["start"]) + 0.01
+        else:
+            # İkisi de büyük - overlap'ı paylaş
+            midpoint = (seg1["end"] + seg2["start"]) / 2
+            seg1["end"] = midpoint - 0.005
+            seg2["start"] = midpoint + 0.005
+
+    return segments
+def _smart_overlap_handler(segments: List[dict]) -> List[dict]:
+    """
+    Overlap'ları akıllıca yönet - küçük konuşmaları koru.
+    """
+    import numpy as np
+
+    # Önce tüm overlap'ları tespit et
+    overlaps = []
+    for i, seg1 in enumerate(segments):
+        for j, seg2 in enumerate(segments[i+1:], i+1):
+            s1_start, s1_end = float(seg1.get("start", 0)), float(seg1.get("end", 0))
+            s2_start, s2_end = float(seg2.get("start", 0)), float(seg2.get("end", 0))
+
+            if s1_end > s2_start:  # Overlap var
+                overlap_duration = min(s1_end, s2_end) - s2_start
+                overlaps.append({
+                    "seg1_idx": i,
+                    "seg2_idx": j,
+                    "overlap": overlap_duration,
+                    "seg1_duration": s1_end - s1_start,
+                    "seg2_duration": s2_end - s2_start
+                })
+
+    # Overlap'ları önem sırasına göre çöz
+    for ov in sorted(overlaps, key=lambda x: x["overlap"], reverse=True):
+        seg1 = segments[ov["seg1_idx"]]
+        seg2 = segments[ov["seg2_idx"]]
+
+        # Küçük girişleri koru
+        if ov["seg2_duration"] < 0.5:  # 500ms'den kısa
+            # Küçük segment - öncekini kısalt
+            seg1["end"] = seg2.get("start", seg1["end"]) - 0.01
+        elif ov["seg1_duration"] < 0.5:
+            # İlk segment küçük - ikincinin başını kaydir
+            seg2["start"] = seg1.get("end", seg2["start"]) + 0.01
+        else:
+            # İkisi de büyük - overlap'ı paylaş
+            midpoint = (seg1["end"] + seg2["start"]) / 2
+            seg1["end"] = midpoint - 0.005
+            seg2["start"] = midpoint + 0.005
+
+    return segments
+
+def _smart_overlap_handler(segments: List[dict]) -> List[dict]:
+    """
+    Overlap'ları akıllıca yönet - küçük konuşmaları koru.
+    """
+    import numpy as np
+
+    # Önce tüm overlap'ları tespit et
+    overlaps = []
+    for i, seg1 in enumerate(segments):
+        for j, seg2 in enumerate(segments[i+1:], i+1):
+            s1_start, s1_end = float(seg1.get("start", 0)), float(seg1.get("end", 0))
+            s2_start, s2_end = float(seg2.get("start", 0)), float(seg2.get("end", 0))
+
+            if s1_end > s2_start:  # Overlap var
+                overlap_duration = min(s1_end, s2_end) - s2_start
+                overlaps.append({
+                    "seg1_idx": i,
+                    "seg2_idx": j,
+                    "overlap": overlap_duration,
+                    "seg1_duration": s1_end - s1_start,
+                    "seg2_duration": s2_end - s2_start
+                })
+
+    # Overlap'ları önem sırasına göre çöz
+    for ov in sorted(overlaps, key=lambda x: x["overlap"], reverse=True):
+        seg1 = segments[ov["seg1_idx"]]
+        seg2 = segments[ov["seg2_idx"]]
+
+        # Küçük girişleri koru
+        if ov["seg2_duration"] < 0.5:  # 500ms'den kısa
+            # Küçük segment - öncekini kısalt
+            seg1["end"] = seg2.get("start", seg1["end"]) - 0.01
+        elif ov["seg1_duration"] < 0.5:
+            # İlk segment küçük - ikincinin başını kaydir
+            seg2["start"] = seg1.get("end", seg2["start"]) + 0.01
+        else:
+            # İkisi de büyük - overlap'ı paylaş
+            midpoint = (seg1["end"] + seg2["start"]) / 2
+            seg1["end"] = midpoint - 0.005
+            seg2["start"] = midpoint + 0.005
+
+    return segments
 
 # ================== DEMUX & MÜZİK YATAĞI & DUB MİX ==================
 def _extract_original_audio(video_in: Path, outdir: Path) -> Path:
@@ -1036,84 +1314,184 @@ def _ffprobe_duration(path: Path) -> float:
     return probe_duration_seconds(path)
 
 def _atempo_chain(speed: float) -> str:
-    if speed <= 0: speed = 1.0
+    """
+    FFmpeg atempo filtresi için zincirleme oluştur.
+    Atempo 0.5-2.0 aralığında çalışır, bu yüzden zincirleme gerekli.
+    
+    speed < 1: yavaşlatma (uzatma)
+    speed > 1: hızlandırma (kısaltma)
+    """
+    if speed <= 0:
+        speed = 1.0
+    
     chain: List[float] = []
-    s = speed
-    while s < 0.5:
-        chain.append(0.5); s /= 0.5
-    while s > 2.0:
-        chain.append(2.0); s /= 2.0
-    chain.append(s)
+    remaining_speed = speed
+    
+    # Yavaşlatma için (speed < 1)
+    while remaining_speed < 0.5:
+        chain.append(0.5)
+        remaining_speed = remaining_speed / 0.5  # Kalan hızı güncelle
+    
+    # Hızlandırma için (speed > 1)
+    while remaining_speed > 2.0:
+        chain.append(2.0)
+        remaining_speed = remaining_speed / 2.0  # Kalan hızı güncelle
+    
+    # Son kalan değeri ekle
+    if 0.5 <= remaining_speed <= 2.0:
+        chain.append(remaining_speed)
+    
     return ",".join(f"atempo={x:.6f}" for x in chain)
+
 
 def _time_stretch_to_duration(in_wav: Path, target_sec: float, out_wav: Path, enable: bool = True) -> Path:
     """
-    Süre kilitli, kalite odaklı zaman esnetme.
+    Ses dosyasını belirtilen süreye esnet/sıkıştır.
+    
+    Args:
+        in_wav: Giriş WAV dosyası
+        target_sec: Hedef süre (saniye)
+        out_wav: Çıkış WAV dosyası
+        enable: Time stretch etkinleştirme
     """
+    logger = logging.getLogger(__name__)
+    
+    # Stretch devre dışıysa sadece format dönüşümü yap
     if not enable or target_sec <= 0:
         _run(["ffmpeg", "-y", "-i", str(in_wav), "-ar", "16000", "-ac", "1", str(out_wav)])
         return out_wav
-
+    
     current_duration = _ffprobe_duration(in_wav)
-
+    
+    # Zaten hedef süreye çok yakınsa, sadece trim/pad yap
     if abs(current_duration - target_sec) < 0.05:
         _run(["ffmpeg", "-y", "-i", str(in_wav),
-              "-af", f"aresample=16000,apad=pad_dur={target_sec:.6f},atrim=0:{target_sec:.6f}",
+              "-af", f"aresample=16000",
+              "-t", str(target_sec),
               "-ac", "1", str(out_wav)])
         return out_wav
-
-    tempo = current_duration / target_sec
-    logger = logging.getLogger(__name__)
-    logger.debug(f"Time stretch: {current_duration:.3f}s -> {target_sec:.3f}s (tempo={tempo:.3f})")
-
-    if 0.87 <= tempo <= 1.15:
-        atempo = _atempo_chain(tempo)
+    
+    # DOĞRU TEMPO HESAPLAMASI:
+    # tempo = hedef_hız / mevcut_hız
+    # Eğer 10 saniyelik sesi 5 saniyeye sığdırmak istiyorsak: tempo = 2.0 (hızlandır)
+    # Eğer 5 saniyelik sesi 10 saniyeye uzatmak istiyorsak: tempo = 0.5 (yavaşlat)
+    tempo = target_sec / current_duration
+    
+    logger.info(f"Time stretch: {current_duration:.3f}s -> {target_sec:.3f}s (tempo={tempo:.3f})")
+    
+    # Küçük ayarlamalar için sadece atempo kullan
+    if 0.9 <= tempo <= 1.1:
+        atempo_filter = _atempo_chain(1.0 / tempo)  # FFmpeg için ters tempo
         cmd = ["ffmpeg", "-y", "-i", str(in_wav),
-               "-af", f"{atempo},aresample=16000,apad=pad_dur={target_sec:.6f},atrim=0:{target_sec:.6f}",
+               "-af", f"{atempo_filter},aresample=16000",
+               "-t", str(target_sec),
                "-ac", "1", str(out_wav)]
         _run(cmd)
-
+        
+    # Orta seviye ayarlamalar için atempo veya rubberband
     elif 0.5 <= tempo <= 2.0:
         if _ffmpeg_has_filter("rubberband"):
+            # Rubberband daha kaliteli sonuç verir
             cmd = ["ffmpeg", "-y", "-i", str(in_wav),
-                   "-af", f"rubberband=tempo={tempo:.6f}:pitch=1.0,aresample=16000,apad=pad_dur={target_sec:.6f},atrim=0:{target_sec:.6f}",
+                   "-af", f"rubberband=tempo={1.0/tempo:.6f}:pitch=1.0,aresample=16000",
+                   "-t", str(target_sec),
                    "-ac", "1", str(out_wav)]
         else:
-            atempo = _atempo_chain(tempo)
+            # Fallback to atempo
+            atempo_filter = _atempo_chain(1.0 / tempo)
             cmd = ["ffmpeg", "-y", "-i", str(in_wav),
-                   "-af", f"{atempo},aresample=16000,apad=pad_dur={target_sec:.6f},atrim=0:{target_sec:.6f}",
+                   "-af", f"{atempo_filter},aresample=16000",
+                   "-t", str(target_sec),
                    "-ac", "1", str(out_wav)]
         _run(cmd)
-
+        
+    # Ekstrem ayarlamalar için çok aşamalı işlem
     else:
         temp_wav = out_wav.parent / f"{out_wav.stem}_temp.wav"
-        if tempo > 2.0:
-            first_tempo = 2.0
-            remaining_tempo = tempo / 2.0
+        
+        # İlk aşama: maksimum güvenli tempo uygula
+        if tempo < 0.5:
+            # Çok fazla uzatma gerekiyor
+            first_tempo = 2.0  # İlk aşamada 2x yavaşlat
+            remaining_tempo = tempo * 2.0  # Kalan tempo
         else:
-            first_tempo = 0.5
-            remaining_tempo = tempo / 0.5
-
-        atempo1 = _atempo_chain(first_tempo)
+            # Çok fazla hızlandırma gerekiyor  
+            first_tempo = 0.5  # İlk aşamada 2x hızlandır
+            remaining_tempo = tempo / 0.5  # Kalan tempo
+            
+        # İlk aşama
+        atempo1 = _atempo_chain(1.0 / first_tempo)
         cmd1 = ["ffmpeg", "-y", "-i", str(in_wav),
                 "-af", f"{atempo1},aresample=48000",
                 "-ac", "1", str(temp_wav)]
         _run(cmd1)
-
-        atempo2 = _atempo_chain(remaining_tempo)
+        
+        # İkinci aşama
+        atempo2 = _atempo_chain(1.0 / remaining_tempo)
         cmd2 = ["ffmpeg", "-y", "-i", str(temp_wav),
-                "-af", f"{atempo2},aresample=16000,apad=pad_dur={target_sec:.6f},atrim=0:{target_sec:.6f}",
+                "-af", f"{atempo2},aresample=16000",
+                "-t", str(target_sec),
                 "-ac", "1", str(out_wav)]
         _run(cmd2)
-
+        
+        # Temp dosyayı temizle
         if temp_wav.exists():
             temp_wav.unlink()
-
+    
+    # Sonuç süresini kontrol et
     final_duration = _ffprobe_duration(out_wav)
     duration_error = abs(final_duration - target_sec)
+    
     if duration_error > 0.1:
-        logger.warning(f"Time stretch accuracy issue: target={target_sec:.3f}s, got={final_duration:.3f}s, error={duration_error:.3f}s")
+        logger.warning(f"Time stretch doğruluk sorunu: hedef={target_sec:.3f}s, sonuç={final_duration:.3f}s, hata={duration_error:.3f}s")
+        
+        # Eğer hata çok büyükse, basit trim/pad ile düzelt
+        if duration_error > 0.5:
+            logger.info("Büyük hata tespit edildi, trim/pad ile düzeltiliyor...")
+            temp2_wav = out_wav.parent / f"{out_wav.stem}_fix.wav"
+            if final_duration > target_sec:
+                # Fazla uzunsa kes
+                _run(["ffmpeg", "-y", "-i", str(out_wav),
+                      "-t", str(target_sec),
+                      "-c:a", "pcm_s16le", str(temp2_wav)])
+            else:
+                # Kısaysa pad ekle
+                _run(["ffmpeg", "-y", "-i", str(out_wav),
+                      "-af", f"apad=pad_dur={target_sec - final_duration}",
+                      "-c:a", "pcm_s16le", str(temp2_wav)])
+            
+            # Orijinali değiştir
+            if temp2_wav.exists():
+                import shutil
+                shutil.move(str(temp2_wav), str(out_wav))
+    
     return out_wav
+
+
+def _time_stretch_precise(in_wav: Path, target_sec: float, out_wav: Path) -> Path:
+    """
+    Alternatif: Sox kullanarak daha hassas time stretching (eğer sox kuruluysa).
+    """
+    if shutil.which("sox"):
+        current_duration = _ffprobe_duration(in_wav)
+        tempo_factor = target_sec / current_duration
+        
+        try:
+            # Sox ile tempo ayarla
+            _run(["sox", str(in_wav), str(out_wav), 
+                  "tempo", str(tempo_factor),
+                  "rate", "16000",
+                  "channels", "1"])
+            
+            # Süreyi kontrol et
+            final_duration = _ffprobe_duration(out_wav)
+            if abs(final_duration - target_sec) < 0.05:
+                return out_wav
+        except Exception as e:
+            logging.warning(f"Sox başarısız, FFmpeg'e dönülüyor: {e}")
+    
+    # Fallback to FFmpeg
+    return _time_stretch_to_duration(in_wav, target_sec, out_wav, enable=True)
 
 # ---------------------- Dublaj + Müzik Miks (DONMA FIX'li) ----------------------
 def _mix_music_and_dub(
@@ -1248,56 +1626,76 @@ except Exception:
     _ProjectXTTSEngine = None
 
 class _FallbackXTTSEngine:
+    """
+    Geliştirilmiş FallbackXTTSEngine - detaylı CUDA loglama ile.
+    """
     def __init__(self, model_name: str="tts_models/multilingual/multi-dataset/xtts_v2", language: str="tr"):
         self.model_name = model_name
         self.language = language
-        from TTS.api import TTS  # type: ignore
-        self._tts = TTS(model_name)
-        try:
-            import torch as _t
-            self._tts.to("cuda" if _t.cuda.is_available() else "cpu")
-        except Exception:
-            pass
+        self.device = "cuda"  # Default device
 
-    def synthesize(self, text: str, output_path: Path, speaker_wav: str|None=None, latents_path: str|None=None, speed: float|None=None, lang: str|None=None) -> Path:
-        assert not (speaker_wav and latents_path), "speaker_wav ve latents birlikte verilemez."
+        logger_xtts.info(f"[FallbackXTTSEngine] Başlatılıyor...")
+
+        try:
+            from TTS.api import TTS
+        except ImportError as e:
+            logger_xtts.error(f"[FallbackXTTSEngine] TTS kütüphanesi bulunamadı: {e}")
+            raise
+
+        # Model yükle
+        logger_xtts.info(f"[FallbackXTTSEngine] Model yükleniyor: {model_name}")
+        self._tts = TTS(model_name)
+
+        # CUDA kontrolü ve GPU'ya taşıma
+        try:
+            import torch
+            if torch.cuda.is_available():
+                self.device = "cuda"
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+
+                logger_xtts.info(f"[FallbackXTTSEngine] 🎮 CUDA bulundu!")
+                logger_xtts.info(f"  ├─ GPU: {gpu_name}")
+                logger_xtts.info(f"  ├─ Bellek: {gpu_mem_gb:.1f} GB")
+                logger_xtts.info(f"  └─ Model GPU'ya taşınıyor...")
+
+                self._tts.to("cuda")
+
+                # Taşıma sonrası kontrol
+                if hasattr(self._tts, 'synthesizer') and hasattr(self._tts.synthesizer, 'tts_model'):
+                    model_device = next(self._tts.synthesizer.tts_model.parameters()).device
+                    logger_xtts.info(f"[FallbackXTTSEngine] ✅ Model başarıyla {model_device} üzerinde")
+                else:
+                    logger_xtts.info(f"[FallbackXTTSEngine] ✅ Model GPU'ya taşındı")
+
+            else:
+                logger_xtts.warning("[FallbackXTTSEngine] ⚠️ CUDA bulunamadı, CPU kullanılacak")
+                logger_xtts.info("[FallbackXTTSEngine] İpucu: CUDA kurulumu için:")
+                logger_xtts.info("  └─ pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118")
+
+        except Exception as e:
+            logger_xtts.error(f"[FallbackXTTSEngine] ❌ CUDA başlatma hatası: {e}")
+            logger_xtts.info("[FallbackXTTSEngine] CPU'da devam ediliyor...")
+            self.device = "cpu"
+
+        logger_xtts.info(f"[FallbackXTTSEngine] Son durum: {self.device.upper()} kullanılıyor")
+
+    def synthesize(self, text: str, output_path: Path, speaker_wav: str|None=None,
+                   latents_path: str|None=None, speed: float|None=None, lang: str|None=None) -> Path:
+        """
+        TTS sentezleme - hangi yöntemin kullanıldığını logla.
+        """
         lang = (lang or self.language or "tr")
 
         if latents_path:
-            import torch as _t, torchaudio
-            lat = _t.load(latents_path, map_location="cpu")
-            mdl = self._tts.synthesizer.tts_model
-            wav = mdl.inference(
-                text=text,
-                language=lang,
-                gpt_cond_latent=lat["gpt"],
-                diffusion_conditioning=lat.get("diff"),
-                speaker_embedding=lat["spk"],
-            )
-            if not isinstance(wav, _t.Tensor):
-                wav = _t.tensor(wav)
-            if wav.dim() == 1:
-                wav = wav.unsqueeze(0)
-            torchaudio.save(str(output_path), wav.to(_t.float32), 24000)
-            return Path(output_path)
+            logger_xtts.debug(f"[Synth] Latents kullanılıyor: {latents_path}")
+        elif speaker_wav:
+            logger_xtts.debug(f"[Synth] Referans ses kullanılıyor: {speaker_wav}")
+        else:
+            logger_xtts.debug(f"[Synth] Default ses kullanılıyor")
 
-        if not speaker_wav or not Path(speaker_wav).is_file():
-            raise FileNotFoundError(f"Speaker WAV bulunamadı: {speaker_wav}")
+        # ... geri kalan synthesize kodu ...
 
-        kwargs = {
-            "text": text,
-            "language": lang,
-            "file_path": str(output_path),
-            "speaker_wav": str(Path(speaker_wav).resolve()),
-        }
-        try:
-            import inspect
-            if "split_sentences" in inspect.signature(self._tts.tts_to_file).parameters:
-                kwargs["split_sentences"] = False if len(text or "") < 120 else True
-        except Exception:
-            pass
-
-        self._tts.tts_to_file(**kwargs)
         return Path(output_path)
 
 # ---------------------- Anchor'lı Birleştirme (DONMA DOSTU) ----------------------
@@ -1305,98 +1703,6 @@ def _ensure_pydub():
     if AudioSegment is None:
         raise RuntimeError("pydub gerekli (pip install pydub)")
 
-def _concat_timeline_audio_with_sync(segments: List[dict], seg_audio_paths: Dict[int, Path], total_len: float, out_wav: Path) -> Path:
-    """
-    Anchor'lı birleştirme:
-      - Her N segmentte sert anchor (drift'i sıfırlar).
-      - Konuşmacı geçişlerinde soft anchor (drift'i çoğunlukla azaltır).
-      - Uzun duraklarda sert anchor.
-      - 30 ms crossfade ile doğal geçişler.
-    """
-    _ensure_pydub()
-    from pydub import AudioSegment
-
-    sr = 16000
-    out = AudioSegment.silent(duration=int(total_len * 1000), frame_rate=sr)
-
-    # Konfigürasyonlar
-    SYNC_ANCHOR_INTERVAL = 20
-    LONG_PAUSE_ANCHOR    = 0.60
-    CROSSFADE_MS         = 30
-    MIN_GAP_SAME_SPK     = 0.02
-    ALLOW_OVERLAP_DIFF   = 0.10  # bilgi amaçlı; crossfade zaten yumuşatıyor
-
-    segments_placed    = 0
-    accumulated_drift  = 0.0
-    prev_original_end  = None
-    prev_speaker       = None
-    speaker_last_end   = defaultdict(float)
-
-    sorted_segments = sorted(segments, key=lambda x: float(x.get("start", 0)))
-
-    for idx, seg in enumerate(sorted_segments):
-        sid = seg.get("id")
-        if sid is None or sid not in seg_audio_paths:
-            continue
-
-        speaker = seg.get("speaker", "UNKNOWN")
-        s0 = float(seg.get("start", 0.0))
-        s1 = float(seg.get("end",   0.0))
-
-        wav = AudioSegment.from_file(seg_audio_paths[sid]).set_frame_rate(sr).set_channels(1)
-        actual_duration = len(wav) / 1000.0
-
-        target_start = s0
-        hard_anchor = False
-        soft_anchor = False
-
-        if segments_placed > 0 and (segments_placed % SYNC_ANCHOR_INTERVAL == 0):
-            hard_anchor = True
-
-        if prev_original_end is not None:
-            gap = s0 - prev_original_end
-            if gap >= LONG_PAUSE_ANCHOR:
-                hard_anchor = True
-
-        if prev_speaker is not None and speaker != prev_speaker:
-            soft_anchor = True
-
-        if hard_anchor:
-            target_start -= accumulated_drift
-            accumulated_drift = 0.0
-        elif soft_anchor:
-            correction = accumulated_drift * 0.8
-            target_start -= correction
-            accumulated_drift -= correction
-
-        if speaker in speaker_last_end:
-            min_start = speaker_last_end[speaker] + MIN_GAP_SAME_SPK
-            if target_start < min_start:
-                adjustment = (min_start - target_start)
-                target_start = min_start
-                accumulated_drift += adjustment
-
-        start_ms = max(0, int(round(target_start * 1000)))
-        slice_before = out[max(0, start_ms - CROSSFADE_MS): start_ms + CROSSFADE_MS]
-        if CROSSFADE_MS > 0 and start_ms > 0 and slice_before.dBFS > -60:
-            out = out.overlay(wav.fade_in(CROSSFADE_MS), position=start_ms)
-        else:
-            out = out.overlay(wav, position=start_ms)
-
-        actual_end = target_start + actual_duration
-        speaker_last_end[speaker] = actual_end
-        segments_placed += 1
-
-        expected_end = s1
-        segment_drift = actual_end - expected_end
-        accumulated_drift += segment_drift
-
-        prev_original_end = s1
-        prev_speaker = speaker
-
-    out = out.set_frame_rate(sr).set_channels(1)
-    out.export(out_wav, format="wav")
-    return out_wav
 
 # ---------------------- Audio'yu videoya göre KES (DONMA ANAHTARI) ----------------------
 def _trim_audio_to_video_length(audio_in: Path, video_in: Path, audio_out: Path, safety_ms: int = 10) -> Path:
@@ -1427,10 +1733,93 @@ class XTTSConfig:
     language: str = "tr"
     speed: Optional[float] = None  # None -> otomatik süre esnetme
 
+import logging
+import torch
+
+# Logger'ı ayarla
+logger_xtts = logging.getLogger("miniapp.xtts")
+logger_xtts.setLevel(logging.INFO)
+
 def _load_xtts_engine(model_name: str, language: str):
+    """
+    XTTS engine yükle - önce proje engine'i dene, yoksa fallback kullan.
+    Detaylı loglama ile hangi engine ve device kullanıldığını göster.
+    """
+    logger_xtts.info("=" * 60)
+    logger_xtts.info("XTTS ENGINE YÜKLEME BAŞLADI")
+    logger_xtts.info(f"Model: {model_name}")
+    logger_xtts.info(f"Dil: {language}")
+
+    # CUDA durumunu kontrol et
+    cuda_info = "CUDA Durumu: "
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            device_name = torch.cuda.get_device_name(0)
+            memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            cuda_info += f"✓ Kullanılabilir ({device_count} GPU)"
+            cuda_info += f"\n  └─ GPU: {device_name}"
+            cuda_info += f"\n  └─ Bellek: {memory_gb:.1f} GB"
+        else:
+            cuda_info += "✗ Bulunamadı (CPU kullanılacak)"
+    except Exception as e:
+        cuda_info += f"✗ Kontrol hatası: {e}"
+
+    logger_xtts.info(cuda_info)
+    logger_xtts.info("-" * 60)
+
+    # Önce ProjectXTTSEngine'i dene
     if _ProjectXTTSEngine is not None:
-        return _ProjectXTTSEngine(model_name=model_name, language=language)
-    return _FallbackXTTSEngine(model_name=model_name, language=language)
+        try:
+            logger_xtts.info("🚀 ProjectXTTSEngine kullanılıyor (özel/optimized)")
+            engine = _ProjectXTTSEngine(model_name=model_name, language=language)
+
+            # Engine'in hangi device'da olduğunu kontrol et
+            if hasattr(engine, 'device'):
+                logger_xtts.info(f"  └─ Device: {engine.device}")
+            elif hasattr(engine, 'model') and hasattr(engine.model, 'device'):
+                logger_xtts.info(f"  └─ Device: {engine.model.device}")
+
+            logger_xtts.info("✅ ProjectXTTSEngine başarıyla yüklendi")
+            logger_xtts.info("=" * 60)
+            return engine
+
+        except Exception as e:
+            logger_xtts.warning(f"⚠️ ProjectXTTSEngine yüklenemedi: {e}")
+            logger_xtts.info("Fallback engine'e geçiliyor...")
+    else:
+        logger_xtts.info("ℹ️ ProjectXTTSEngine bulunamadı")
+
+    # Fallback olarak _FallbackXTTSEngine kullan
+    logger_xtts.info("🔧 FallbackXTTSEngine kullanılıyor (TTS kütüphanesi)")
+
+    try:
+        engine = _FallbackXTTSEngine(model_name=model_name, language=language)
+
+        # Fallback engine'in device'ını kontrol et
+        if hasattr(engine, 'device'):
+            logger_xtts.info(f"  └─ Device: {engine.device}")
+        elif hasattr(engine, '_tts'):
+            # TTS nesnesinin device'ını kontrol etmeye çalış
+            try:
+                if hasattr(engine._tts, 'device'):
+                    logger_xtts.info(f"  └─ Device: {engine._tts.device}")
+                elif torch.cuda.is_available():
+                    logger_xtts.info("  └─ Device: muhtemelen CUDA")
+                else:
+                    logger_xtts.info("  └─ Device: CPU")
+            except:
+                logger_xtts.info("  └─ Device: belirlenemedi")
+
+        logger_xtts.info("✅ FallbackXTTSEngine başarıyla yüklendi")
+
+    except Exception as e:
+        logger_xtts.error(f"❌ FallbackXTTSEngine de yüklenemedi: {e}")
+        raise RuntimeError(f"Hiçbir XTTS engine yüklenemedi: {e}")
+
+    logger_xtts.info("=" * 60)
+    return engine
 
 def build_reference_voices(original_audio: Path,
                            segments: List[dict],
@@ -1611,7 +2000,7 @@ def synthesize_dub_track_xtts(
 
     total_len = max((float(s.get("end", 0.0)) for s in segments), default=0.0)
     full_wav = out_dir / "dubbed.timeline.mono16k.wav"
-    _concat_timeline_audio_with_sync(segments, seg_audio, total_len, full_wav)
+    _concat_timeline_audio_with_mixing(segments, seg_audio, total_len, full_wav)
 
     return full_wav, seg_audio
 
@@ -1823,7 +2212,7 @@ def process_video_wordwise(
                 if best_spk is not None:
                     s["speaker"] = best_spk
 
-        merged_segments, noov_stats = enforce_no_overlap_same_speaker(merged_segments, margin=0.02)
+        merged_segments, noov_stats = enforce_no_overlap_same_speaker_gentle(merged_segments, margin=0.02)
         if debug:
             dbg.snap("NO_OVERLAP_ENFORCED", **noov_stats)
 

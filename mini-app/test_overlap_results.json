@@ -1,0 +1,68 @@
+[
+  {
+    "speaker": "SPEAKER_00",
+    "start": 0.0,
+    "end": 3.0,
+    "text": "Hello there"
+  },
+  {
+    "speaker": "SPEAKER_01",
+    "start": 2.9,
+    "end": 5.0,
+    "text": "Hi, how are you"
+  },
+  {
+    "speaker": "SPEAKER_00",
+    "start": 5.0,
+    "end": 7.3,
+    "text": "I wanted to say"
+  },
+  {
+    "speaker": "SPEAKER_01",
+    "start": 7.2,
+    "end": 9.0,
+    "text": "Sorry to interrupt"
+  },
+  {
+    "speaker": "SPEAKER_00",
+    "start": 10.0,
+    "end": 12.0,
+    "text": "First part"
+  },
+  {
+    "speaker": "SPEAKER_00",
+    "start": 11.5,
+    "end": 13.0,
+    "text": "Second part"
+  },
+  {
+    "speaker": "SPEAKER_00",
+    "start": 15.0,
+    "end": 16.0,
+    "text": "Quick"
+  },
+  {
+    "speaker": "SPEAKER_01",
+    "start": 15.9,
+    "end": 16.6,
+    "text": "Response"
+  },
+  {
+    "speaker": "SPEAKER_02",
+    "start": 16.5,
+    "end": 17.5,
+    "text": "Another"
+  },
+  {
+    "speaker": "SPEAKER_00",
+    "start": 20.0,
+    "end": 25.0,
+    "text": "Long statement"
+  },
+  {
+    "speaker": "SPEAKER_01",
+    "start": 25.02,
+    "end": 26.0,
+    "text": "Overlapping long"
+  }
+]
